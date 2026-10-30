@@ -1,0 +1,9 @@
+[Unit]
+Description=AI Team dispatcher tick
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=AI_TEAM_CONFIG=/etc/ai-team/team-config.yaml
+ExecStart=/usr/bin/python3 /opt/ai-team/dispatcher.py tick

@@ -1,0 +1,9 @@
+[Unit]
+Description=AI Team morning summary at 07:30 KST
+
+[Timer]
+OnCalendar=*-*-* 07:30:00 Asia/Seoul
+Persistent=true
+
+[Install]
+WantedBy=timers.target

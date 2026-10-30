@@ -1,0 +1,3 @@
+#!/bin/sh
+# 상시 브라우저에서 소셜 버튼으로 다시 로그인 (브라우저 봇 사용자로 실행). 사용: ai-browser-relogin saramin [--check]
+exec /usr/bin/node /usr/local/lib/ai-team/ai-browser-relogin.js "$@"

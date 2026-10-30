@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: 의존성
+        run: |
+          pip install pyyaml pytest
+          # 서버의 Playwright MCP(@playwright/mcp@0.0.83)와 같은 playwright-core
+          npm install --no-save --prefix "$RUNNER_TEMP/pw" playwright-core@1.64.0-alpha-1790635538000
+      - name: 테스트 (문법·안전장치·확인 서비스·배포 동기화·자동 재로그인 E2E)
+        env:
+          AI_PW_CORE: ${{ runner.temp }}/pw/node_modules/playwright-core
+          CHROME: /usr/bin/google-chrome
+        run: python -m pytest -v tests

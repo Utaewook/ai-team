@@ -1,0 +1,759 @@
+#!/usr/bin/env python3
+"""ai-approve — 되돌릴 수 없는 행동을 사람의 일회용 코드로만 실행하는 확인 서비스 (root)
+
+구조
+  봇 ──(유닉스 소켓 /run/ai-approve.sock, 그룹 ai-approve)──▶ 이 서비스(root, 요청마다 실행)
+  1) 봇이 행동을 요청 → 내용 저장 + 6자리 코드 생성 → Telegram 으로 사람에게 내용과 코드 전송
+  2) 사람이 코드를 봇에게 답장 → 봇이 (요청 ID, 코드) 를 넘김 → 서비스가 확인 후 실행
+  - 실행 권한(예: Gmail 발송 토큰)은 root 전용 파일에만 있어 봇이 직접 실행할 수 없다.
+  - 코드는 요청 하나에만 맞고(요청 ID 와 묶어 해시), 15분 뒤 만료, 3번 틀리면 취소.
+  - 요청한 봇만 자기 요청을 확인·취소할 수 있다(소켓의 상대 프로세스 사용자로 판별).
+
+  ai-approve serve                       소켓 연결 1건 처리 (systemd 가 실행)
+  ai-approve status                      대기 중인 요청과 최근 기록
+  ai-approve setup-google                발송 전용 Gmail 토큰 등록 (gmail.send 만, root 전용)
+  ai-approve google-auth --scopes … --out FILE --owner USER     (ai-bot 이 쓰는 내부 명령)
+
+  ai-approve setup-jira-admin            Jira 설정 변경용 토큰 등록 (봇 전용 계정, root 전용 파일)
+  ai-approve jira-option agent|product 값   Jira 드롭다운에 옵션 추가 (이미 있으면 그대로)
+
+행동 종류 (bot.yaml 의 approve 목록에 있는 것만 요청 가능)
+  mail.send      {to, cc, subject, body, thread_id?, in_reply_to?}       사람의 일회용 코드 필요
+  project.add    {key, name, share, brief}                             바로 실행 (사후 알림)
+  project.brief  {key, brief}                                          바로 실행 (사후 알림)
+"""
+import argparse
+import base64
+import datetime as dt
+import email.message
+import email.utils
+import fcntl
+import getpass
+import hashlib
+import hmac
+import json
+import os
+import pwd
+import re
+import secrets
+import socket
+import struct
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import subprocess
+
+import yaml
+
+ETC = os.environ.get("AI_BOT_ETC", "/etc/ai-team")
+STATE = os.environ.get("AI_APPROVE_STATE", "/var/lib/ai-team/approvals")
+CLIENT_FILE = os.path.join(ETC, "google-client.env")
+BROKER_GOOGLE = os.path.join(ETC, "google-broker.env")
+DISPATCHER_DIR = os.environ.get("AI_TEAM_DISPATCHER_DIR", "/opt/ai-team")
+TTL_MIN = 15
+MAX_TRIES = 3
+MAX_PENDING = 5
+REDIRECT = "http://127.0.0.1:8765/"
+JIRA_ADMIN = os.path.join(ETC, "jira-admin.env")
+TEAM_CONFIG = os.environ.get("AI_TEAM_CONFIG", os.path.join(ETC, "team-config.yaml"))
+JIRA_SHARED = os.environ.get("AI_JIRA_CONFIG", "/etc/ai-team-jira.yaml")
+UPDATE_INSTRUCTIONS = os.environ.get("AI_TEAM_UPDATE_INSTRUCTIONS", "/usr/local/sbin/ai-team-update-instructions")
+KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}$")
+MAX_BRIEF = 8000
+EMAIL_RE = re.compile(r"^[^@\s,<>]+@[^@\s,<>]+\.[^@\s,<>]+$")
+
+GMAIL_SEND = "https://www.googleapis.com/auth/gmail.send"
+SEND_CAPABLE = {"https://mail.google.com/", "https://www.googleapis.com/auth/gmail.send",
+                "https://www.googleapis.com/auth/gmail.compose", "https://www.googleapis.com/auth/gmail.modify",
+                "https://www.googleapis.com/auth/gmail.insert"}
+
+
+class Refuse(Exception):
+    pass
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def read_env(path):
+    env = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return env
+
+
+def write_secret(path, env, uid=0, gid=0):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("".join(f"{k}={v}\n" for k, v in env.items()))
+    os.chown(tmp, uid, gid)
+    os.replace(tmp, path)
+
+
+def http(method, url, data=None, headers=None, form=False):
+    body = None
+    headers = dict(headers or {})
+    if data is not None:
+        if form:
+            body = urllib.parse.urlencode(data).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            body = json.dumps(data).encode()
+            headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as err:
+        raise Refuse(f"{method} {url.split('?')[0]} → HTTP {err.code}: {err.read().decode(errors='replace')[:300]}") from None
+
+
+# ───────────────────────────── Google OAuth ─────────────────────────────
+
+def access_token(env):
+    out = http("POST", "https://oauth2.googleapis.com/token", {
+        "client_id": env["GOOGLE_CLIENT_ID"], "client_secret": env["GOOGLE_CLIENT_SECRET"],
+        "refresh_token": env["GOOGLE_REFRESH_TOKEN"], "grant_type": "refresh_token"}, form=True)
+    return out["access_token"]
+
+
+def token_scopes(token):
+    info = http("GET", "https://oauth2.googleapis.com/tokeninfo?access_token=" + urllib.parse.quote(token))
+    return set((info.get("scope") or "").split())
+
+
+def client_credentials():
+    env = read_env(CLIENT_FILE)
+    if env.get("GOOGLE_CLIENT_ID") and env.get("GOOGLE_CLIENT_SECRET"):
+        return env
+    print("Google Cloud 의 OAuth 클라이언트(데스크톱 앱) 정보를 한 번만 입력합니다.")
+    cid = input("클라이언트 ID: ").strip()
+    secret = getpass.getpass("클라이언트 보안 비밀번호 (보이지 않음): ").strip()
+    if not cid.endswith(".apps.googleusercontent.com") or not secret:
+        raise Refuse("클라이언트 ID 형식이 아닙니다 (….apps.googleusercontent.com)")
+    env = {"GOOGLE_CLIENT_ID": cid, "GOOGLE_CLIENT_SECRET": secret}
+    write_secret(CLIENT_FILE, env)
+    return env
+
+
+def google_auth(scopes, out_path, owner, forbid=(), require=()):
+    """사람이 PC 브라우저에서 동의 → 리디렉트 주소를 붙여넣기 → 토큰 저장. 토큰은 화면에 나오지 않는다."""
+    client = client_credentials()
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
+        "client_id": client["GOOGLE_CLIENT_ID"], "redirect_uri": REDIRECT, "response_type": "code",
+        "scope": " ".join(scopes), "access_type": "offline", "prompt": "consent",
+        "code_challenge": challenge, "code_challenge_method": "S256", "state": state})
+    print("\n1) 아래 주소를 PC 브라우저에서 열고, 사용할 Google 계정으로 동의하세요.")
+    print("   ('확인되지 않은 앱' 화면이 나오면 [고급] → [이동] 을 누르세요. 내가 만든 앱입니다.)\n")
+    print(url)
+    print("\n2) 동의 후 '사이트에 연결할 수 없음' 페이지가 뜨면 정상입니다. 그 페이지의 주소창 전체를 복사해 붙여넣으세요.")
+    pasted = getpass.getpass("주소 (보이지 않음): ").strip()
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)
+    if q.get("state", [""])[0] != state:
+        raise Refuse("주소가 이번 요청의 것이 아닙니다 (state 불일치). 처음부터 다시 해 주세요.")
+    if "error" in q:
+        raise Refuse(f"동의가 취소되었습니다: {q['error'][0]}")
+    code = q.get("code", [""])[0]
+    tok = http("POST", "https://oauth2.googleapis.com/token", {
+        "client_id": client["GOOGLE_CLIENT_ID"], "client_secret": client["GOOGLE_CLIENT_SECRET"],
+        "code": code, "code_verifier": verifier, "grant_type": "authorization_code", "redirect_uri": REDIRECT}, form=True)
+    if not tok.get("refresh_token"):
+        raise Refuse("refresh 토큰을 받지 못했습니다. Google 계정 → 보안 → 타사 앱 액세스에서 이 앱을 지운 뒤 다시 해 주세요.")
+    granted = set(tok.get("scope", "").split())
+    bad = granted & set(forbid)
+    if bad:
+        raise Refuse(f"허용하면 안 되는 권한이 포함됐습니다: {', '.join(sorted(bad))} (저장하지 않음)")
+    missing = set(require) - granted
+    if missing:
+        raise Refuse(f"필요한 권한이 빠졌습니다: {', '.join(sorted(missing))}. 동의 화면에서 모든 항목에 체크해 주세요 (저장하지 않음)")
+    pw = pwd.getpwnam(owner)
+    write_secret(out_path, {**client, "GOOGLE_REFRESH_TOKEN": tok["refresh_token"]}, pw.pw_uid, pw.pw_gid)
+    print(f"✅ 저장: {out_path}  (권한: {', '.join(sorted(s.rsplit('/', 1)[-1] for s in granted))})")
+    return granted
+
+
+# ───────────────────────────── 행동: mail.send ─────────────────────────────
+
+def check_addrs(value, field, required):
+    items = [a.strip() for a in re.split(r"[,;]", value or "") if a.strip()]
+    if required and not items:
+        raise Refuse(f"{field} 가 비어 있습니다")
+    if len(items) > 10:
+        raise Refuse(f"{field} 는 10명까지")
+    for a in items:
+        addr = email.utils.parseaddr(a)[1]
+        if not EMAIL_RE.match(addr):
+            raise Refuse(f"{field} 주소 형식이 아닙니다: {a}")
+    return items
+
+
+def validate_mail(p):
+    out = {"to": check_addrs(p.get("to"), "to", True), "cc": check_addrs(p.get("cc"), "cc", False),
+           "subject": str(p.get("subject") or "").strip(), "body": str(p.get("body") or "")}
+    if not out["subject"] or len(out["subject"]) > 250 or "\n" in out["subject"]:
+        raise Refuse("제목은 1~250자, 한 줄")
+    if not out["body"].strip() or len(out["body"]) > 20000:
+        raise Refuse("본문은 1~20000자")
+    for k in ("thread_id", "in_reply_to"):
+        v = str(p.get(k) or "").strip()
+        if v and (len(v) > 300 or "\n" in v):
+            raise Refuse(f"{k} 형식 오류")
+        out[k] = v
+    return out
+
+
+def describe_mail(p):
+    body = p["body"].strip()
+    short = body if len(body) <= 1500 else body[:1500] + "\n…(이하 생략)"
+    lines = [f"받는 사람: {', '.join(p['to'])}"]
+    if p["cc"]:
+        lines.append(f"참조: {', '.join(p['cc'])}")
+    lines.append(f"제목: {p['subject']}" + ("  (답장)" if p.get("thread_id") else ""))
+    return "\n".join(lines) + f"\n\n{short}"
+
+
+def execute_mail(p):
+    env = read_env(BROKER_GOOGLE)
+    if not env.get("GOOGLE_REFRESH_TOKEN"):
+        raise Refuse("발송용 Gmail 토큰이 없습니다 (관리자: sudo ai-approve setup-google)")
+    msg = email.message.EmailMessage()
+    msg["To"] = ", ".join(p["to"])
+    if p["cc"]:
+        msg["Cc"] = ", ".join(p["cc"])
+    msg["Subject"] = p["subject"]
+    if p.get("in_reply_to"):
+        msg["In-Reply-To"] = p["in_reply_to"]
+        msg["References"] = p["in_reply_to"]
+    msg.set_content(p["body"], charset="utf-8", cte="base64")
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    body = {"raw": raw}
+    if p.get("thread_id"):
+        body["threadId"] = p["thread_id"]
+    out = http("POST", "https://gmail.googleapis.com/gmail/v1/users/me/messages/send", body,
+               {"Authorization": f"Bearer {access_token(env)}"})
+    return f"발송 완료 (message id {out.get('id')})"
+
+
+# ───────────────────────────── Jira 드롭다운 옵션 (설정 변경용 토큰) ─────────────────────────────
+
+def team_config():
+    with open(TEAM_CONFIG, encoding="utf-8") as fh:
+        return yaml.safe_load(fh) or {}
+
+
+class JiraAdmin:
+    """root 전용 토큰(jira-admin.env)으로 사용자 지정 필드의 드롭다운 옵션만 다룬다."""
+
+    def __init__(self, env=None):
+        env = env or read_env(JIRA_ADMIN)
+        if not env.get("JIRA_TOKEN"):
+            raise Refuse("Jira 설정 변경용 토큰이 없습니다. 관리자가 sudo ai-approve setup-jira-admin 으로 등록해야 합니다.")
+        scoped = env.get("JIRA_TOKEN_SCOPED", "true").lower() in ("1", "true", "yes")
+        self.base = f"https://api.atlassian.com/ex/jira/{env['JIRA_CLOUD_ID']}" if scoped else env["JIRA_URL"].rstrip("/")
+        self.auth = "Basic " + base64.b64encode(f"{env['JIRA_EMAIL']}:{env['JIRA_TOKEN']}".encode()).decode()
+        self.fields = (team_config().get("jira") or {}).get("fields") or {}
+
+    def req(self, method, path, body=None):
+        return http(method, self.base + path, body, {"Authorization": self.auth, "Accept": "application/json"})
+
+    def field_id(self, alias):
+        fid = self.fields.get(alias)
+        if not fid:
+            raise Refuse(f"team-config.yaml 의 jira.fields 에 {alias} 가 없습니다")
+        return fid
+
+    def context_id(self, fid):
+        ctx = self.req("GET", f"/rest/api/3/field/{fid}/context?maxResults=50").get("values") or []
+        if not ctx:
+            raise Refuse(f"{fid} 필드에 컨텍스트가 없습니다")
+        glob = [c for c in ctx if c.get("isGlobalContext")]
+        return (glob or ctx)[0]["id"]
+
+    def options(self, alias):
+        fid = self.field_id(alias)
+        cid = self.context_id(fid)
+        out, start = [], 0
+        while True:
+            page = self.req("GET", f"/rest/api/3/field/{fid}/context/{cid}/option?startAt={start}&maxResults=100")
+            vals = page.get("values") or []
+            out += vals
+            if page.get("isLast", True) or not vals:
+                break
+            start += len(vals)
+        return fid, cid, out
+
+    def add_option(self, alias, value):
+        """옵션을 추가. 이미 있으면(비활성이면 다시 켬) False."""
+        fid, cid, opts = self.options(alias)
+        for o in opts:
+            if o.get("value") == value:
+                if o.get("disabled"):
+                    self.req("PUT", f"/rest/api/3/field/{fid}/context/{cid}/option",
+                             {"options": [{"id": o["id"], "value": value, "disabled": False}]})
+                    return True
+                return False
+        self.req("POST", f"/rest/api/3/field/{fid}/context/{cid}/option", {"options": [{"value": value}]})
+        return True
+
+
+# ───────────────────────────── 프로젝트(Product) 추가·브리프 ─────────────────────────────
+
+def one_line(value, field, limit):
+    value = str(value or "").strip()
+    if not value or len(value) > limit or "\n" in value or "\r" in value:
+        raise Refuse(f"{field} 는 1~{limit}자 한 줄")
+    return value
+
+
+def clean_brief(text, key, name=None):
+    text = str(text or "").replace("\r\n", "\n").strip()
+    if not 20 <= len(text) <= MAX_BRIEF:
+        raise Refuse(f"brief 는 20~{MAX_BRIEF}자")
+    if not text.startswith("# "):
+        text = f"# {key} — {name or key}\n\n{text}"
+    return text + "\n"
+
+
+def validate_project_add(p):
+    key = str(p.get("key") or "").strip().upper()
+    if not KEY_RE.match(key):
+        raise Refuse("key 는 영문 대문자로 시작하는 2~10자 (영문 대문자·숫자)")
+    if key in (team_config().get("products") or {}):
+        raise Refuse(f"{key} 는 이미 있는 프로젝트입니다 (브리프 수정은 project.brief)")
+    name = one_line(p.get("name"), "name", 60)
+    try:
+        share = round(float(p.get("share", 0.2)), 2)
+    except (TypeError, ValueError):
+        raise Refuse("share 는 숫자 (0.05~1)") from None
+    if not 0.05 <= share <= 1:
+        raise Refuse("share 는 0.05~1")
+    return {"key": key, "name": name, "share": share, "brief": clean_brief(p.get("brief"), key, name)}
+
+
+def validate_project_brief(p):
+    key = str(p.get("key") or "").strip().upper()
+    if key not in (team_config().get("products") or {}):
+        raise Refuse(f"{key} 는 등록된 프로젝트가 아닙니다 (새 프로젝트는 project.add)")
+    name = key
+    try:
+        with open(os.path.join(brief_dir(), f"{key}.md"), encoding="utf-8") as fh:
+            m = re.search(r"^#\s+\S+\s+—\s+(.+)$", fh.read(), re.M)
+            name = m.group(1).strip() if m else key
+    except FileNotFoundError:
+        pass
+    return {"key": key, "brief": clean_brief(p.get("brief"), key, name)}
+
+
+def describe_project(p):
+    head = f"프로젝트 {p['key']}" + (f" — {p['name']} (사용량 비율 {p['share']})" if "name" in p else " 브리프 교체")
+    brief = p["brief"] if len(p["brief"]) <= 1500 else p["brief"][:1500] + "\n…(생략)"
+    return f"{head}\n\n{brief}"
+
+
+def brief_dir():
+    return team_config().get("context_dir") or "/etc/ai-team-projects"
+
+
+def write_text(path, text, mode=0o644):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def add_product_line(key, share, name):
+    """team-config.yaml 의 products 블록 끝에 한 줄 추가 (주석·순서 유지). 결과를 YAML 로 다시 읽어 확인."""
+    with open(TEAM_CONFIG, encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+    start = next((i for i, l in enumerate(lines) if re.match(r"^products:\s*(#.*)?$", l)), None)
+    if start is None:
+        raise Refuse("team-config.yaml 에 products: 블록이 없습니다")
+    last = start
+    for i in range(start + 1, len(lines)):
+        if re.match(r"^\s+[A-Za-z0-9_]+\s*:", lines[i]):
+            last = i
+        elif lines[i].strip() == "" or lines[i].lstrip().startswith("#") and lines[i].startswith(" "):
+            continue
+        else:
+            break
+    safe_name = re.sub(r"[#\n]", " ", name)
+    lines.insert(last + 1, f"  {key}: {share}     # {safe_name}")
+    text = "\n".join(lines)
+    check = yaml.safe_load(text) or {}
+    if (check.get("products") or {}).get(key) != share:
+        raise Refuse("team-config.yaml 수정 결과를 확인하지 못했습니다 (변경하지 않음)")
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    with open(os.path.join(STATE, f"team-config.{now().strftime('%Y%m%d-%H%M%S')}.bak"), "w", encoding="utf-8") as fh:
+        fh.write(open(TEAM_CONFIG, encoding="utf-8").read())
+    write_text(TEAM_CONFIG, text, os.stat(TEAM_CONFIG).st_mode & 0o777)
+
+
+def refresh_shared_products():
+    """ai-jira 가 검사하는 /etc/ai-team-jira.yaml 의 products 목록 갱신."""
+    try:
+        with open(JIRA_SHARED, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return
+    head = "".join(l + "\n" for l in text.split("\n") if l.startswith("#"))
+    shared = yaml.safe_load(text) or {}
+    shared["products"] = list((team_config().get("products") or {}).keys())
+    write_text(JIRA_SHARED, head + yaml.safe_dump(shared, allow_unicode=True, sort_keys=False))
+
+
+def rebuild_index():
+    res = subprocess.run([UPDATE_INSTRUCTIONS, "--index-only"], capture_output=True, text=True, timeout=120)
+    if res.returncode != 0:
+        raise Refuse(f"프로젝트 목록 갱신 실패: {(res.stderr or res.stdout)[-300:]}")
+
+
+def execute_project_add(p):
+    key = p["key"]
+    if "product" in ((team_config().get("jira") or {}).get("text_fields") or []):
+        jira_note = "Jira Product Key 는 텍스트 필드라 옵션 추가 불필요"
+    else:
+        jira_note = "Jira Product 옵션 추가" if JiraAdmin().add_option("product", key) else "Jira Product 옵션은 이미 있음"
+    path = os.path.join(brief_dir(), f"{key}.md")
+    write_text(path, p["brief"])
+    add_product_line(key, p["share"], p["name"])
+    refresh_shared_products()
+    rebuild_index()
+    return f"프로젝트 {key} 추가 완료 ({jira_note} · 브리프 {path} · 비율 {p['share']})"
+
+
+def execute_project_brief(p):
+    path = os.path.join(brief_dir(), f"{p['key']}.md")
+    if os.path.isfile(path):
+        os.makedirs(STATE, mode=0o700, exist_ok=True)
+        with open(os.path.join(STATE, f"brief-{p['key']}.{now().strftime('%Y%m%d-%H%M%S')}.bak"), "w", encoding="utf-8") as fh:
+            fh.write(open(path, encoding="utf-8").read())
+    write_text(path, p["brief"])
+    rebuild_index()
+    return f"프로젝트 {p['key']} 브리프 교체 완료 ({path})"
+
+
+# direct: True → 사람 코드 없이 바로 실행하고 결과만 알림 (되돌리기 쉬운 설정 추가만)
+ACTIONS = {"mail.send": {"title": "📨 메일 발송", "validate": validate_mail, "describe": describe_mail,
+                         "execute": execute_mail},
+           "project.add": {"title": "🗂 프로젝트 추가", "validate": validate_project_add, "describe": describe_project,
+                           "execute": execute_project_add, "direct": True},
+           "project.brief": {"title": "🗂 프로젝트 브리프 교체", "validate": validate_project_brief,
+                             "describe": describe_project, "execute": execute_project_brief, "direct": True}}
+
+
+# ───────────────────────────── 요청 저장소 ─────────────────────────────
+
+def allowed_actions(bot):
+    try:
+        with open(os.path.join(ETC, "bots.d", bot, "bot.yaml"), encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        return []
+    if cfg.get("enabled", True) is False:
+        return []
+    return [a for a in (cfg.get("approve") or []) if a in ACTIONS]
+
+
+class Store:
+    def __init__(self):
+        os.makedirs(STATE, mode=0o700, exist_ok=True)
+        self.lock = open(os.path.join(STATE, ".lock"), "w")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        self.path = os.path.join(STATE, "pending.json")
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                self.items = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.items = {}
+        self.expired = []
+        for rid, item in list(self.items.items()):
+            if dt.datetime.fromisoformat(item["expires"]) < now():
+                self.expired.append(self.items.pop(rid))
+
+    def save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self.items, fh, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.path)
+
+    def close(self):
+        fcntl.flock(self.lock, fcntl.LOCK_UN)
+        self.lock.close()
+
+
+def code_hash(rid, code):
+    return hashlib.sha256(f"{rid}:{code}".encode()).hexdigest()
+
+
+def audit(event, **fields):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    with open(os.path.join(STATE, "log.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"at": now().isoformat(timespec="seconds"), "event": event, **fields}, ensure_ascii=False) + "\n")
+
+
+def notify(text):
+    sys.path.insert(0, DISPATCHER_DIR)
+    import dispatcher  # noqa: E402
+    cfg = dispatcher.load_config()
+    dispatcher.notify(cfg, text)
+
+
+def handle(bot, req):
+    op = req.get("op")
+    store = Store()
+    try:
+        for item in store.expired:
+            audit("expired", id=item["id"], bot=item["bot"], action=item["action"])
+        if store.expired:
+            store.save()
+        if op == "request":
+            action = req.get("action")
+            if action not in allowed_actions(bot):
+                raise Refuse(f"{bot} 봇은 '{action}' 을 요청할 수 없습니다 (bot.yaml 의 approve 목록)")
+            payload = ACTIONS[action]["validate"](req.get("payload") or {})
+            if ACTIONS[action].get("direct"):
+                try:
+                    result = ACTIONS[action]["execute"](payload)
+                except Refuse as err:
+                    audit("failed", bot=bot, action=action, error=str(err))
+                    raise
+                audit("executed", bot=bot, action=action, result=result)
+                notify(f"{ACTIONS[action]['title']} [{bot}] ✅ {result}\n\n{ACTIONS[action]['describe'](payload)}")
+                return {"ok": True, "message": result}
+            mine = [i for i in store.items.values() if i["bot"] == bot]
+            if len(mine) >= MAX_PENDING:
+                raise Refuse(f"대기 중인 요청이 {MAX_PENDING}건이라 더 받을 수 없습니다 (확인·취소 후 다시)")
+            rid = secrets.token_hex(3)
+            code = f"{secrets.randbelow(10**6):06d}"
+            expires = now() + dt.timedelta(minutes=TTL_MIN)
+            store.items[rid] = {"id": rid, "bot": bot, "action": action, "payload": payload, "tries": 0,
+                                "hash": code_hash(rid, code), "expires": expires.isoformat()}
+            store.save()
+            audit("requested", id=rid, bot=bot, action=action, summary=ACTIONS[action]["describe"](payload)[:300])
+            notify(f"{ACTIONS[action]['title']} 승인 요청 [{bot}] #{rid}\n\n{ACTIONS[action]['describe'](payload)}\n\n"
+                   f"🔑 승인 코드: {code}\n이 내용이 맞으면 코드를 {bot} 에게 답장으로 보내세요. "
+                   f"이상하면 무시하세요 ({TTL_MIN}분 뒤 자동 취소).")
+            return {"ok": True, "id": rid, "expires_in_min": TTL_MIN,
+                    "message": "승인 요청을 사람에게 보냈습니다. 사람이 알려 주는 코드를 confirm 으로 넘기세요."}
+        if op in ("confirm", "cancel"):
+            rid = str(req.get("id") or "")
+            item = store.items.get(rid)
+            if not item or item["bot"] != bot:
+                raise Refuse(f"요청 #{rid} 가 없습니다 (만료됐거나 다른 봇의 요청)")
+            if op == "cancel":
+                store.items.pop(rid)
+                store.save()
+                audit("cancelled", id=rid, bot=bot)
+                return {"ok": True, "message": f"#{rid} 취소"}
+            code = re.sub(r"\D", "", str(req.get("code") or ""))
+            if not hmac.compare_digest(code_hash(rid, code), item["hash"]):
+                item["tries"] += 1
+                left = MAX_TRIES - item["tries"]
+                audit("bad_code", id=rid, bot=bot, tries=item["tries"])
+                if left <= 0:
+                    store.items.pop(rid)
+                    store.save()
+                    notify(f"⚠️ 승인 요청 #{rid} 코드가 {MAX_TRIES}번 틀려 취소했습니다 [{bot}]")
+                    raise Refuse("코드가 3번 틀려 요청을 취소했습니다")
+                store.save()
+                raise Refuse(f"코드가 맞지 않습니다 (남은 시도 {left}번)")
+            store.items.pop(rid)
+            store.save()
+            try:
+                result = ACTIONS[item["action"]]["execute"](item["payload"])
+            except Refuse as err:
+                audit("failed", id=rid, bot=bot, error=str(err))
+                notify(f"❌ #{rid} 실행 실패: {err}")
+                raise
+            audit("executed", id=rid, bot=bot, action=item["action"], result=result)
+            notify(f"✅ #{rid} {result}")
+            return {"ok": True, "message": result}
+        if op == "list":
+            return {"ok": True, "pending": [{"id": i["id"], "action": i["action"], "expires": i["expires"],
+                                             "summary": ACTIONS[i["action"]]["describe"](i["payload"])[:200]}
+                                            for i in store.items.values() if i["bot"] == bot]}
+        raise Refuse(f"알 수 없는 op: {op}")
+    finally:
+        store.close()
+
+
+def peer_user(conn):
+    creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    _pid, uid, _gid = struct.unpack("3i", creds)
+    name = pwd.getpwuid(uid).pw_name
+    if not name.startswith("bot-"):
+        raise Refuse("봇 사용자만 요청할 수 있습니다")
+    return name[4:]
+
+
+def serve_conn(conn):
+    try:
+        bot = peer_user(conn)
+        data = b""
+        conn.settimeout(10)
+        while not data.endswith(b"\n") and len(data) < 200_000:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        resp = handle(bot, json.loads(data.decode("utf-8")))
+    except Refuse as err:
+        resp = {"ok": False, "error": str(err)}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        resp = {"ok": False, "error": "요청 형식 오류"}
+    except Exception as err:  # noqa: BLE001
+        resp = {"ok": False, "error": f"내부 오류: {type(err).__name__}"}
+    conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode())
+
+
+def cmd_serve(_a):
+    conn = socket.socket(fileno=0)
+    try:
+        serve_conn(conn)
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_status(_a):
+    store = Store()
+    try:
+        print(f"대기 중 {len(store.items)}건")
+        for i in store.items.values():
+            print(f"  #{i['id']} [{i['bot']}] {i['action']} 만료 {i['expires'][11:16]}Z 시도 {i['tries']}")
+    finally:
+        store.close()
+    try:
+        with open(os.path.join(STATE, "log.jsonl"), encoding="utf-8") as fh:
+            lines = fh.readlines()[-10:]
+        print("최근 기록:")
+        for line in lines:
+            e = json.loads(line)
+            print(f"  {e['at'][:19]} {e['event']:10} #{e.get('id', '')} {e.get('bot', '')} {e.get('result') or e.get('error') or ''}")
+    except FileNotFoundError:
+        pass
+    print(f"Jira 설정 변경용 토큰: {'있음' if read_env(JIRA_ADMIN).get('JIRA_TOKEN') else '없음 (sudo ai-approve setup-jira-admin)'}")
+    print(f"발송용 Gmail 토큰: {'있음' if read_env(BROKER_GOOGLE).get('GOOGLE_REFRESH_TOKEN') else '없음 (sudo ai-approve setup-google)'}")
+    return 0
+
+
+def cmd_setup_google(_a):
+    google_auth([GMAIL_SEND], BROKER_GOOGLE, "root", require=[GMAIL_SEND],
+                forbid=SEND_CAPABLE - {GMAIL_SEND} | {"https://www.googleapis.com/auth/gmail.readonly"})
+    return 0
+
+
+def cmd_setup_jira_admin(a):
+    tc = team_config()
+    jenv = read_env(((tc.get("jira") or {}).get("env_file")) or os.path.join(ETC, "jira.env"))
+    site = ((tc.get("jira") or {}).get("site") or "").rstrip("/")
+    cloud = jenv.get("JIRA_CLOUD_ID")
+    if not (cloud and site):
+        raise Refuse("team-config.yaml 의 jira.site 또는 jira.env 의 JIRA_CLOUD_ID 가 없습니다")
+    if a.from_bot:
+        src = os.path.join(f"/home/bot-{a.from_bot}", ".config", "ai-bot", "jira.env")
+        benv = read_env(src)
+        if not benv.get("JIRA_TOKEN"):
+            raise Refuse(f"{src} 에 토큰이 없습니다 (먼저 sudo ai-bot secret {a.from_bot} jira)")
+        email, token = benv["JIRA_EMAIL"], benv["JIRA_TOKEN"]
+        print(f"{a.from_bot} 봇의 Jira 토큰({email})을 드롭다운 옵션 추가에도 씁니다.")
+    else:
+        print("Jira 드롭다운 옵션(Product·Agent) 추가에 쓰는 토큰입니다. root 만 읽을 수 있게 저장합니다.")
+        email = input("Jira 관리자 권한을 준 봇 계정 이메일: ").strip()
+        token = getpass.getpass("그 계정의 API 토큰 (보이지 않음): ").strip()
+    base = {"JIRA_URL": site, "JIRA_CLOUD_ID": cloud, "JIRA_EMAIL": email, "JIRA_TOKEN": token}
+    # 일반 토큰은 사이트 주소, 범위 지정 토큰은 api.atlassian.com — 옵션 읽기까지 되는 쪽을 쓴다
+    errors, chosen = {}, None
+    for mode, label in (("false", "사이트 주소(일반 토큰)"), ("true", "api.atlassian.com(범위 지정 토큰)")):
+        env = dict(base, JIRA_TOKEN_SCOPED=mode)
+        try:
+            ja = JiraAdmin(env)
+            me = ja.req("GET", "/rest/api/3/myself")
+            found = {alias: ja.options(alias)[2] for alias in ("product", "agent")}
+            chosen = (env, me, found, label)
+            break
+        except Refuse as err:
+            errors[label] = str(err)[:220]
+    if not chosen:
+        detail = "\n".join(f"  - {k}: {v}" for k, v in errors.items())
+        raise Refuse("드롭다운 옵션을 읽지 못했습니다.\n" + detail +
+                     "\n사이트 주소가 401 이면 범위 지정 토큰입니다 → 범위 없는 일반 'API 토큰 만들기' 토큰을 쓰세요."
+                     "\n403 이면 계정에 Jira 관리자 권한이 없습니다.")
+    env, me, found, label = chosen
+    approver = (tc.get("admin") or {}).get("approver_account_id")
+    if approver and me.get("accountId") == approver:
+        raise Refuse("관리 요청 승인자(사람) 계정의 토큰입니다. 봇 전용 계정의 토큰을 넣어 주세요 (저장하지 않음).")
+    for alias, opts in found.items():
+        print(f"  ✅ {alias} 옵션 읽기: {', '.join(o['value'] for o in opts if not o.get('disabled'))}")
+    write_secret(JIRA_ADMIN, env)
+    print(f"🔑 저장: {JIRA_ADMIN} (root 전용) — 계정 {me.get('displayName', '')}, 접속 방식 {label}")
+    return 0
+
+
+def cmd_jira_option(a):
+    value = a.value.strip()
+    if not re.match(r"^[A-Za-z0-9._-]{1,30}$", value):
+        raise Refuse("옵션 값은 영문·숫자·._- 1~30자")
+    added = JiraAdmin().add_option(a.field, value)
+    print(f"{'✅ 추가' if added else '이미 있음'}: {a.field} = {value}")
+    return 0
+
+
+def cmd_google_auth(a):
+    google_auth(a.scopes.split(), a.out, a.owner, forbid=a.forbid.split() if a.forbid else (),
+                require=a.scopes.split())
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="ai-approve")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("serve")
+    sub.add_parser("status")
+    sub.add_parser("setup-google")
+    s = sub.add_parser("setup-jira-admin")
+    s.add_argument("--from-bot", help="이 봇의 Jira 토큰을 그대로 사용 (예: leader)")
+    s = sub.add_parser("jira-option")
+    s.add_argument("field", choices=["agent", "product"])
+    s.add_argument("value")
+    s = sub.add_parser("google-auth")
+    s.add_argument("--scopes", required=True)
+    s.add_argument("--out", required=True)
+    s.add_argument("--owner", required=True)
+    s.add_argument("--forbid", default="")
+    a = p.parse_args(argv)
+    if a.cmd != "serve" and os.geteuid() != 0:
+        sys.exit("root 권한이 필요합니다: sudo ai-approve …")
+    try:
+        return {"serve": cmd_serve, "status": cmd_status, "setup-google": cmd_setup_google,
+                "google-auth": cmd_google_auth,
+                "setup-jira-admin": cmd_setup_jira_admin, "jira-option": cmd_jira_option}[a.cmd](a)
+    except Refuse as err:
+        print(f"❌ {err}")
+        return 1
+    except KeyboardInterrupt:
+        print("\n중단")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

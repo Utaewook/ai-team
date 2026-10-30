@@ -1,0 +1,23 @@
+# 그룹	저장소 경로	설치 위치	권한
+# core: 항상 설치 · browser: 브라우저 구성(/usr/local/lib/ai-team/playwright-mcp)이 있을 때만
+core	src/dispatcher.py	/opt/ai-team/dispatcher.py	755
+core	src/jira-setup.py	/opt/ai-team/jira-setup.py	755
+core	src/ai-bot	/usr/local/sbin/ai-bot	755
+core	src/update-instructions.py	/usr/local/sbin/ai-team-update-instructions	755
+core	src/ai-approve	/usr/local/sbin/ai-approve	755
+core	src/vault-sync	/usr/local/bin/ai-vault-sync	755
+core	src/ai-jira	/usr/local/bin/ai-jira	755
+core	src/ai-google	/usr/local/bin/ai-google	755
+core	src/ai-project	/usr/local/bin/ai-project	755
+core	deploy/ai-team-deploy	/usr/local/sbin/ai-team-deploy	755
+core	systemd/ai-team-dispatch.service	/etc/systemd/system/ai-team-dispatch.service	644
+core	systemd/ai-team-dispatch.timer	/etc/systemd/system/ai-team-dispatch.timer	644
+core	systemd/ai-team-summary.service	/etc/systemd/system/ai-team-summary.service	644
+core	systemd/ai-team-summary.timer	/etc/systemd/system/ai-team-summary.timer	644
+core	systemd/ai-team-deploy.service	/etc/systemd/system/ai-team-deploy.service	644
+core	systemd/ai-team-deploy.timer	/etc/systemd/system/ai-team-deploy.timer	644
+browser	src/ai-browser-guard	/usr/local/bin/ai-browser-guard	755
+browser	src/ai-browser-keepalive	/usr/local/bin/ai-browser-keepalive	755
+browser	src/ai-browser-relogin	/usr/local/bin/ai-browser-relogin	755
+browser	src/ai-browser-relogin.js	/usr/local/lib/ai-team/ai-browser-relogin.js	644
+browser	src/relogin-sites.json	/usr/local/lib/ai-team/relogin-sites.json	644

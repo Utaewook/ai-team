@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""ai-project — 팀이 다루는 프로젝트(= Jira Product 키) 목록 조회·추가·브리프 교체 (root 소유, 봇은 실행만)
+
+  ai-project list                                   등록된 프로젝트 키와 이름
+  ai-project show <KEY>                             프로젝트 브리프 보기
+  ai-project add <KEY> --name "이름" [--share 0.2] (--brief-file 파일|- | --brief "마크다운")   (- 는 표준입력)
+  ai-project brief <KEY> (--brief-file 파일 | --brief "마크다운")
+
+add 는 root 확인 서비스가 한 번에 처리한다:
+  Jira Product 드롭다운 옵션 추가 → 브리프 /etc/ai-team-projects/<KEY>.md → team-config.yaml products → 프로젝트 목록 갱신
+삭제·비율 변경 명령은 없다 (사람이 서버에서 직접).
+"""
+import argparse
+import json
+import os
+import re
+import socket
+import sys
+
+import yaml
+
+SOCK = os.environ.get("AI_APPROVE_SOCK", "/run/ai-approve.sock")
+SHARED = os.environ.get("AI_JIRA_CONFIG", "/etc/ai-team-jira.yaml")
+PROJ = os.environ.get("AI_TEAM_PROJECTS", "/etc/ai-team-projects")
+
+
+class Fail(Exception):
+    pass
+
+
+def call(req):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(90)
+        s.connect(SOCK)
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode())
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except (FileNotFoundError, PermissionError, ConnectionRefusedError) as err:
+        raise Fail(f"확인 서비스에 연결할 수 없습니다 ({type(err).__name__}). 이 봇의 bot.yaml approve 목록에 "
+                   f"project.add 가 없을 수 있습니다.") from None
+    finally:
+        s.close()
+    resp = json.loads(data.decode() or "{}")
+    if not resp.get("ok"):
+        raise Fail(resp.get("error") or "확인 서비스 오류")
+    return resp
+
+
+def brief_text(a):
+    if a.brief_file == "-":
+        return sys.stdin.read()
+    if a.brief_file:
+        with open(a.brief_file, encoding="utf-8") as fh:
+            return fh.read()
+    if a.brief:
+        return a.brief.replace("\\n", "\n")
+    raise Fail("--brief-file 또는 --brief 가 필요합니다")
+
+
+def cmd_list(_a):
+    try:
+        with open(SHARED, encoding="utf-8") as fh:
+            keys = (yaml.safe_load(fh) or {}).get("products") or []
+    except FileNotFoundError:
+        keys = []
+    if not keys:
+        print("(등록된 프로젝트 없음)")
+    for k in keys:
+        title = "(브리프 없음)"
+        try:
+            with open(os.path.join(PROJ, f"{k}.md"), encoding="utf-8") as fh:
+                m = re.search(r"^#\s+(.+)$", fh.read(), re.M)
+                title = m.group(1).strip() if m else k
+        except FileNotFoundError:
+            pass
+        print(f"{k:10} {title}")
+    return 0
+
+
+def cmd_show(a):
+    path = os.path.join(PROJ, f"{a.key.upper()}.md")
+    if not os.path.isfile(path):
+        raise Fail(f"{a.key.upper()} 브리프가 없습니다")
+    with open(path, encoding="utf-8") as fh:
+        print(fh.read())
+    return 0
+
+
+def cmd_add(a):
+    r = call({"op": "request", "action": "project.add",
+              "payload": {"key": a.key, "name": a.name, "share": a.share, "brief": brief_text(a)}})
+    print(r["message"])
+    return 0
+
+
+def cmd_brief(a):
+    r = call({"op": "request", "action": "project.brief", "payload": {"key": a.key, "brief": brief_text(a)}})
+    print(r["message"])
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="ai-project")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    s = sub.add_parser("show")
+    s.add_argument("key")
+    for name in ("add", "brief"):
+        s = sub.add_parser(name)
+        s.add_argument("key")
+        if name == "add":
+            s.add_argument("--name", required=True)
+            s.add_argument("--share", type=float, default=0.2)
+        s.add_argument("--brief-file")
+        s.add_argument("--brief")
+    a = p.parse_args(argv)
+    try:
+        return {"list": cmd_list, "show": cmd_show, "add": cmd_add, "brief": cmd_brief}[a.cmd](a)
+    except Fail as err:
+        print(f"❌ {err}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

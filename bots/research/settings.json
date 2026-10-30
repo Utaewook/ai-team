@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch", "WebFetch",
+      "Edit(/home/bot-research/bots/research/notes/**)"
+    ],
+    "deny": [
+      "Bash"
+    ]
+  }
+}

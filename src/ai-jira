@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""ai-jira — 봇이 자기 Jira 계정으로 TEAM 스페이스를 직접 다루는 명령 (root 소유, 봇은 실행만)
+
+  ai-jira list [--status 상태,…] [--agent 봇] [--product 키] [--all] [--limit 30]
+  ai-jira search "<JQL>" [--limit 30]
+  ai-jira show TEAM-12 [--comments 3]
+  ai-jira create --summary "…" --agent dev --product STR [--window ASAP|Night|Weekend] [--run-at 2026-10-31T01:00+09:00]
+                 [--max-turns 30] [--description "…"] [--todo]          (기본: 바로 Scheduled → 디스패처가 실행)
+  ai-jira update TEAM-12 [--summary …] [--description …] [--agent …] [--product …] [--window …]
+                 [--run-at … | --clear-run-at] [--max-turns N]
+  ai-jira move TEAM-12 todo|scheduled|paused|review|done|failed
+  ai-jira comment TEAM-12 "마크다운 텍스트"
+
+상태 이름: todo(해야 할 일) scheduled paused review(검토 중) done(완료) failed · in_progress 는 디스패처 전용
+안전장치: 삭제 명령 없음 · 관리 요청(admin-request) 이슈는 읽기만 · 진행 중으로 직접 옮길 수 없음
+설정: /etc/ai-team-jira.yaml (비밀 아님, ai-bot 이 생성) · 토큰: ~/.config/ai-bot/jira.env (봇 자신의 계정)
+"""
+import argparse
+import datetime as dt
+import os
+import sys
+
+import yaml
+
+sys.path.insert(0, os.environ.get("AI_TEAM_DISPATCHER_DIR", "/opt/ai-team"))
+import dispatcher as d  # noqa: E402  (Jira 클라이언트·서식 변환 재사용)
+
+SHARED = os.environ.get("AI_JIRA_CONFIG", "/etc/ai-team-jira.yaml")
+STATUS_ALIASES = ["todo", "scheduled", "in_progress", "paused", "review", "done", "failed"]
+MOVABLE = ["todo", "scheduled", "paused", "review", "done", "failed"]
+OPEN = ["todo", "scheduled", "in_progress", "paused", "review", "failed"]
+WINDOWS = ["ASAP", "Night", "Weekend"]
+
+
+class Fail(Exception):
+    pass
+
+
+def load():
+    try:
+        with open(SHARED, encoding="utf-8") as fh:
+            shared = yaml.safe_load(fh)
+    except FileNotFoundError:
+        raise Fail(f"{SHARED} 가 없습니다. 이 봇의 정의에 jira: true 를 넣고 sudo ai-bot apply <봇> 을 실행해야 합니다.") from None
+    env_file = os.path.expanduser(os.environ.get("AI_JIRA_ENV", "~/.config/ai-bot/jira.env"))
+    if not os.path.isfile(env_file):
+        raise Fail(f"Jira 토큰이 없습니다 ({env_file}). 관리자가 sudo ai-bot secret <봇> jira 로 등록해야 합니다.")
+    cfg = {"jira": dict(shared["jira"], env_file=env_file), "_tz": d.ZoneInfo(shared.get("timezone", "Asia/Seoul"))}
+    return shared, cfg, d.Jira(cfg)
+
+
+def status_name(shared, sid):
+    for alias, value in shared["jira"]["statuses"].items():
+        if str(value) == str(sid):
+            return alias
+    return sid
+
+
+def row(shared, issue):
+    f = shared["jira"]["fields"]
+    x = issue["fields"]
+    st = status_name(shared, (x.get("status") or {}).get("id"))
+    vals = [issue["key"], st, d.option_value(x.get(f["agent"])) or "-", d.option_value(x.get(f["product"])) or "-",
+            d.option_value(x.get(f["window"])) or "-"]
+    return f"{vals[0]:9} {vals[1]:12} {vals[2]:10} {vals[3]:6} {vals[4]:8} {x.get('summary', '')[:70]}"
+
+
+def text_fields(shared):
+    return set(shared["jira"].get("text_fields") or [])
+
+
+def is_admin(shared, issue):
+    return shared["jira"].get("admin_label", "admin-request") in (issue["fields"].get("labels") or [])
+
+
+def guard_writable(shared, jira, key):
+    issue = jira.raw_issue(key, ["labels", "status"])
+    if is_admin(shared, issue):
+        raise Fail(f"{key} 는 관리 요청 이슈라 읽기만 할 수 있습니다 (승인·거절은 사람이 Jira 에서).")
+    return issue
+
+
+def parse_time(text, tz):
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M"):
+        try:
+            when = dt.datetime.strptime(text.replace("+09:00", "+0900").replace("Z", "+0000"), fmt)
+            return when if when.tzinfo else when.replace(tzinfo=tz)
+        except ValueError:
+            continue
+    raise Fail(f"시각 형식을 알 수 없습니다: {text} (예: 2026-10-31T01:00+09:00)")
+
+
+def check_choice(shared, kind, value):
+    allowed = {"agent": shared.get("agents") or [], "product": shared.get("products") or [], "window": WINDOWS}[kind]
+    if value is not None and allowed and value not in allowed:
+        raise Fail(f"{kind} 값은 {', '.join(allowed)} 중 하나여야 합니다: {value}")
+
+
+def field_updates(shared, cfg, a):
+    f = shared["jira"]["fields"]
+    out = {}
+    if a.summary is not None:
+        out["summary"] = a.summary[:250]
+    if a.description is not None:
+        out["description"] = d.md_to_adf(a.description)
+    for kind in ("agent", "product", "window"):
+        value = getattr(a, kind)
+        check_choice(shared, kind, value)
+        if value is not None:
+            out[f[kind]] = value if kind in text_fields(shared) else {"value": value}
+    if getattr(a, "clear_run_at", False):
+        out[f["run_at"]] = None
+    elif a.run_at:
+        out[f["run_at"]] = d.to_jira_time(parse_time(a.run_at, cfg["_tz"]))
+    if a.max_turns is not None:
+        if not 1 <= a.max_turns <= 200:
+            raise Fail("max-turns 는 1~200")
+        out[f["max_turns"]] = a.max_turns
+    return out
+
+
+def cmd_list(shared, cfg, jira, a):
+    s = shared["jira"]["statuses"]
+    clauses = [f'project = "{shared["jira"]["project_key"]}"']
+    statuses = a.status.split(",") if a.status else ([] if a.all else OPEN)
+    for st in statuses:
+        if st not in STATUS_ALIASES:
+            raise Fail(f"상태 이름: {', '.join(STATUS_ALIASES)}")
+    if statuses:
+        clauses.append("status in (" + ",".join(str(s[x]) for x in statuses) + ")")
+    for kind in ("agent", "product"):
+        value = getattr(a, kind)
+        if value:
+            fid = shared["jira"]["fields"][kind].split("_")[-1]
+            op = "~" if kind in text_fields(shared) else "="   # 텍스트 필드는 = 검색 불가
+            clauses.append(f'cf[{fid}] {op} "{value}"')
+    jql = " AND ".join(clauses) + " ORDER BY updated DESC"
+    return print_issues(shared, jira, jql, a.limit)
+
+
+def print_issues(shared, jira, jql, limit):
+    issues = jira.search(jql, max_results=limit)
+    if not issues:
+        print("(없음)")
+        return 0
+    print(f"{'키':9} {'상태':12} {'Agent':10} {'Prod':6} {'Window':8} 제목")
+    for issue in issues:
+        print(row(shared, issue))
+    print(f"— {len(issues)}건" + (" (더 있을 수 있음, --limit)" if len(issues) >= limit else ""))
+    return 0
+
+
+def cmd_search(shared, cfg, jira, a):
+    return print_issues(shared, jira, a.jql, a.limit)
+
+
+def cmd_show(shared, cfg, jira, a):
+    f = shared["jira"]["fields"]
+    key = d.norm_key(cfg, a.key)
+    issue = jira.raw_issue(key, ["summary", "status", "description", "labels", "created", "updated"] + list(f.values()))
+    x = issue["fields"]
+    print(f"{key}  [{status_name(shared, x['status']['id'])}]  {x.get('summary')}")
+    print(f"Agent={d.option_value(x.get(f['agent'])) or '-'}  Product={d.option_value(x.get(f['product'])) or '-'}  "
+          f"Window={d.option_value(x.get(f['window'])) or '-'}  Run At={x.get(f['run_at']) or '-'}  "
+          f"Max Turns={x.get(f['max_turns']) or '-'}  Usage={x.get(f['usage']) or 0}")
+    if is_admin(shared, issue):
+        print("※ 관리 요청 이슈 (읽기 전용)")
+    print(f"갱신: {x.get('updated', '')[:16]}  {shared['jira']['site'].rstrip('/')}/browse/{key}")
+    print("\n── 설명 ──\n" + (d.adf_to_text(x.get("description")).strip() or "(없음)"))
+    if a.comments:
+        page = jira._req("GET", f"/rest/api/3/issue/{key}/comment?orderBy=-created&maxResults={a.comments}")
+        for c in reversed(page.get("comments", [])):
+            text = d.adf_to_text(c.get("body")).strip()
+            print(f"\n── 코멘트 {c.get('created', '')[:16]} {c.get('author', {}).get('displayName', '')} ──\n"
+                  + (text[:3000] + ("\n…(잘림)" if len(text) > 3000 else "")))
+    return 0
+
+
+def cmd_create(shared, cfg, jira, a):
+    for kind in ("agent", "product", "window"):
+        check_choice(shared, kind, getattr(a, kind))
+    if not a.agent or not a.product:
+        raise Fail("--agent 와 --product 는 필수입니다")
+    f = shared["jira"]["fields"]
+    fields = {"project": {"key": shared["jira"]["project_key"]},
+              "issuetype": {"id": str(shared["jira"]["task_type_id"])},
+              "summary": a.summary[:250],
+              "description": d.md_to_adf(a.description or a.summary),
+              f["agent"]: {"value": a.agent},
+              f["product"]: a.product if "product" in text_fields(shared) else {"value": a.product},
+              f["window"]: {"value": a.window or "Night"}, f["max_turns"]: a.max_turns or 30}
+    if a.run_at:
+        fields[f["run_at"]] = d.to_jira_time(parse_time(a.run_at, cfg["_tz"]))
+    key = jira.create(fields)
+    if not a.todo:
+        jira.transition(key, "scheduled")
+    print(f"{key} 생성 ({'해야 할 일' if a.todo else 'Scheduled — 디스패처가 시간 창에 맞춰 실행'})  "
+          f"{shared['jira']['site'].rstrip('/')}/browse/{key}")
+    return 0
+
+
+def cmd_update(shared, cfg, jira, a):
+    key = d.norm_key(cfg, a.key)
+    guard_writable(shared, jira, key)
+    fields = field_updates(shared, cfg, a)
+    if not fields:
+        raise Fail("바꿀 항목이 없습니다")
+    jira.set_raw(key, fields)
+    print(f"{key} 수정: {', '.join(k for k in vars(a) if getattr(a, k) not in (None, False) and k not in ('cmd', 'key'))}")
+    return 0
+
+
+def cmd_move(shared, cfg, jira, a):
+    key = d.norm_key(cfg, a.key)
+    if a.status not in MOVABLE:
+        raise Fail(f"옮길 수 있는 상태: {', '.join(MOVABLE)} (진행 중은 디스패처 전용)")
+    issue = guard_writable(shared, jira, key)
+    if status_name(shared, issue["fields"]["status"]["id"]) == "in_progress" and a.status != "paused":
+        raise Fail(f"{key} 는 실행 중입니다. 멈추려면 paused 로만 옮길 수 있습니다.")
+    jira.transition(key, a.status)
+    print(f"{key} → {a.status}")
+    return 0
+
+
+def cmd_comment(shared, cfg, jira, a):
+    key = d.norm_key(cfg, a.key)
+    guard_writable(shared, jira, key)
+    jira.comment(key, a.text)
+    print(f"{key} 코멘트 추가")
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="ai-jira", description="TEAM Jira 직접 조작 (삭제 불가, 관리 요청은 읽기만)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("list")
+    s.add_argument("--status")
+    s.add_argument("--agent")
+    s.add_argument("--product")
+    s.add_argument("--all", action="store_true", help="완료 포함 모든 상태")
+    s.add_argument("--limit", type=int, default=30)
+    s = sub.add_parser("search")
+    s.add_argument("jql")
+    s.add_argument("--limit", type=int, default=30)
+    s = sub.add_parser("show")
+    s.add_argument("key")
+    s.add_argument("--comments", type=int, default=3)
+    for name in ("create", "update"):
+        s = sub.add_parser(name)
+        if name == "update":
+            s.add_argument("key")
+        s.add_argument("--summary", required=(name == "create"))
+        s.add_argument("--description")
+        s.add_argument("--agent")
+        s.add_argument("--product")
+        s.add_argument("--window", choices=WINDOWS)
+        s.add_argument("--run-at", dest="run_at")
+        s.add_argument("--max-turns", dest="max_turns", type=int)
+        if name == "update":
+            s.add_argument("--clear-run-at", dest="clear_run_at", action="store_true")
+        else:
+            s.add_argument("--todo", action="store_true", help="Scheduled 대신 해야 할 일로 (바로 실행하지 않음)")
+    s = sub.add_parser("move")
+    s.add_argument("key")
+    s.add_argument("status")
+    s = sub.add_parser("comment")
+    s.add_argument("key")
+    s.add_argument("text")
+    a = p.parse_args(argv)
+    try:
+        shared, cfg, jira = load()
+        return {"list": cmd_list, "search": cmd_search, "show": cmd_show, "create": cmd_create,
+                "update": cmd_update, "move": cmd_move, "comment": cmd_comment}[a.cmd](shared, cfg, jira, a)
+    except (Fail, d.JiraError) as err:
+        print(f"❌ {err}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

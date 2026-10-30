@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""ai-browser-guard — 브라우저 봇의 Playwright 도구 호출을 검사하는 Claude Code PreToolUse 훅 (root 소유)
+
+  저장·제출성 동작 → "ask": Claude Code 가 권한 요청을 띄우고 Telegram 으로 ✅ Allow / ❌ Deny 버튼이 간다.
+                     승인은 Telegram 플러그인이 처리하므로 봇(모델)은 스스로 승인할 수 없다.
+  임의 코드 실행    → "deny"
+  나머지(읽기·이동·입력) → 통과
+
+  사용 (봇 settings.json 의 hooks):  ai-browser-guard --allow saramin.co.kr,groupby.kr,rememberapp.co.kr
+"""
+import json
+import re
+import sys
+import urllib.parse
+
+RISKY = re.compile(
+    r"저장|제출|지원|등록|완료|확인|보내|전송|발송|결제|구매|주문|삭제|탈퇴|변경|동의|게시|공개|업로드|수락|신청|"
+    r"apply|submit|save|send|confirm|delete|remove|purchase|pay|order|publish|update|accept|agree|upload|post",
+    re.I)
+DENY_TOOLS = {"browser_evaluate": "페이지 안에서 임의 코드를 실행하는 도구는 쓸 수 없습니다",
+              "browser_run_code_unsafe": "임의 코드 실행 도구는 쓸 수 없습니다",
+              "browser_drop": "드래그&드롭 파일·데이터 주입은 쓸 수 없습니다"}
+
+
+def out(decision, reason):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                             "permissionDecisionReason": reason}}, ensure_ascii=False))
+    return 0
+
+
+def host_ok(url, allowed):
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return any(host == a or host.endswith("." + a) for a in allowed)
+
+
+def decide(tool, inp, allowed):
+    name = tool.rsplit("__", 1)[-1]
+    if name in DENY_TOOLS:
+        return "deny", DENY_TOOLS[name]
+    if name == "browser_click":
+        el = str(inp.get("element") or "").strip()
+        if not el:
+            return "ask", "설명 없는 클릭 — 무엇을 누르는지 확인이 필요합니다"
+        if RISKY.search(el) or inp.get("doubleClick"):
+            return "ask", f"'{el[:80]}' 클릭 — 저장·제출성 동작이라 승인이 필요합니다"
+        return None
+    if name == "browser_press_key" and re.fullmatch(r"(?i)(numpad)?enter", str(inp.get("key") or "")):
+        return "ask", "Enter 키 — 폼이 제출될 수 있어 승인이 필요합니다 (버튼은 이름으로 클릭하세요)"
+    if name == "browser_type" and inp.get("submit"):
+        return "ask", "입력 후 제출(submit) — 승인이 필요합니다"
+    if name == "browser_file_upload":
+        return "ask", f"파일 업로드: {', '.join(map(str, inp.get('paths') or []))[:200]}"
+    if name == "browser_handle_dialog" and inp.get("accept"):
+        return "ask", "대화상자 '확인' — 저장·삭제 확인일 수 있어 승인이 필요합니다"
+    if name == "browser_navigate" and allowed and not host_ok(str(inp.get("url") or ""), allowed):
+        return "ask", f"허용 목록 밖 사이트로 이동: {str(inp.get('url'))[:150]}"
+    if name == "browser_tabs" and inp.get("url") and allowed and not host_ok(str(inp["url"]), allowed):
+        return "ask", f"허용 목록 밖 사이트를 새 탭으로: {str(inp['url'])[:150]}"
+    return None
+
+
+def main(argv):
+    allowed = []
+    if "--allow" in argv:
+        allowed = [a.strip().lower() for a in argv[argv.index("--allow") + 1].split(",") if a.strip()]
+    try:
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        return out("deny", "훅 입력을 읽지 못했습니다")
+    tool = str(data.get("tool_name") or "")
+    if "playwright" not in tool:
+        return 0
+    result = decide(tool, data.get("tool_input") or {}, allowed)
+    if result:
+        return out(*result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""ai-google — 봇이 쓰는 Gmail(읽기)·Google Calendar 명령. 메일 발송은 확인 서비스(ai-approve)를 거친다.
+
+  ai-google mail search "<Gmail 검색식>" [--limit 10]     예: "is:unread newer_than:2d", "from:recruit@ subject:면접"
+  ai-google mail read <메시지ID> [--max 6000]
+  ai-google mail thread <스레드ID>
+  ai-google mail send --to a@x.com [--cc …] --subject "…" --body "…" [--reply-to <메시지ID>]
+        → 사람에게 승인 코드가 간다. 사람이 알려 준 코드로:
+  ai-google mail confirm <요청ID> <코드>
+  ai-google mail pending | ai-google mail cancel <요청ID>
+
+  ai-google cal list [--days 7] [--from 2026-11-01]
+  ai-google cal add --title "…" --start "2026-11-03 15:00" [--end "…" | --minutes 60] [--all-day] [--location …] [--desc …]
+  ai-google cal update <이벤트ID> [--title …] [--start …] [--end …] [--location …] [--desc …]
+
+토큰: ~/.config/ai-bot/google.env (gmail.readonly + calendar.events, 발송 권한 없음)
+안전장치: 발송은 매번 사람의 일회용 코드 필요 · 일정 삭제 없음 · 참석자 초대 없음(초대 메일이 나가므로)
+"""
+import argparse
+import base64
+import datetime as dt
+import html
+import json
+import os
+import re
+import socket
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from zoneinfo import ZoneInfo
+
+ENV_FILE = os.path.expanduser(os.environ.get("AI_GOOGLE_ENV", "~/.config/ai-bot/google.env"))
+SOCK = os.environ.get("AI_APPROVE_SOCK", "/run/ai-approve.sock")
+TZ = ZoneInfo(os.environ.get("AI_GOOGLE_TZ", "Asia/Seoul"))
+GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
+CAL = "https://www.googleapis.com/calendar/v3/calendars/primary"
+
+
+class Fail(Exception):
+    pass
+
+
+def read_env(path):
+    env = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                if "=" in line and not line.lstrip().startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    env[k] = v
+    except FileNotFoundError:
+        raise Fail(f"Google 토큰이 없습니다 ({path}). 관리자가 sudo ai-bot secret <봇> google 로 등록해야 합니다.") from None
+    return env
+
+
+def http(method, url, data=None, token=None, form=False):
+    headers = {"Accept": "application/json"}
+    body = None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if data is not None:
+        body = urllib.parse.urlencode(data).encode() if form else json.dumps(data).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded" if form else "application/json"
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode(errors="replace")[:300]
+        if err.code in (401, 403) and "invalid_grant" in detail:
+            raise Fail("Google 토큰이 만료·취소되었습니다. 관리자가 sudo ai-bot secret <봇> google 로 다시 등록해야 합니다.") from None
+        raise Fail(f"Google API {method} {url.split('?')[0].rsplit('/', 2)[-2:]} → HTTP {err.code}: {detail}") from None
+
+
+def token():
+    env = read_env(ENV_FILE)
+    return http("POST", "https://oauth2.googleapis.com/token", {
+        "client_id": env["GOOGLE_CLIENT_ID"], "client_secret": env["GOOGLE_CLIENT_SECRET"],
+        "refresh_token": env["GOOGLE_REFRESH_TOKEN"], "grant_type": "refresh_token"}, form=True)["access_token"]
+
+
+# ───────────────────────────── 메일 ─────────────────────────────
+
+def header(msg, name):
+    for h in msg.get("payload", {}).get("headers", []):
+        if h["name"].lower() == name.lower():
+            return h["value"]
+    return ""
+
+
+def b64(data):
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode("utf-8", errors="replace")
+
+
+def html_to_text(s):
+    s = re.sub(r"(?is)<(script|style).*?</\1>", "", s)
+    s = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>", "\n", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    return re.sub(r"\n{3,}", "\n\n", html.unescape(s)).strip()
+
+
+def body_text(payload):
+    plain, rich, files = [], [], []
+
+    def walk(part):
+        mime = part.get("mimeType", "")
+        data = (part.get("body") or {}).get("data")
+        if part.get("filename"):
+            files.append(f"{part['filename']} ({mime}, {(part.get('body') or {}).get('size', 0)} bytes)")
+        elif mime == "text/plain" and data:
+            plain.append(b64(data))
+        elif mime == "text/html" and data:
+            rich.append(html_to_text(b64(data)))
+        for sub in part.get("parts") or []:
+            walk(sub)
+    walk(payload)
+    return ("\n".join(plain) if plain else "\n".join(rich)).strip(), files
+
+
+def cmd_mail_search(a):
+    t = token()
+    q = urllib.parse.urlencode({"q": a.query, "maxResults": a.limit})
+    ids = http("GET", f"{GMAIL}/messages?{q}", token=t).get("messages") or []
+    if not ids:
+        print("(없음)")
+        return 0
+    for m in ids:
+        msg = http("GET", f"{GMAIL}/messages/{m['id']}?format=metadata&metadataHeaders=From&metadataHeaders=Subject"
+                          f"&metadataHeaders=Date", token=t)
+        unread = "●" if "UNREAD" in msg.get("labelIds", []) else " "
+        date = header(msg, "Date")[:22]
+        print(f"{unread} {m['id']}  {date:22}  {header(msg, 'From')[:40]:40}  {header(msg, 'Subject')[:70]}")
+        print(f"     {html.unescape(msg.get('snippet', ''))[:120]}")
+    return 0
+
+
+def print_message(msg, limit):
+    text, files = body_text(msg.get("payload", {}))
+    print(f"ID {msg['id']}  스레드 {msg.get('threadId')}")
+    for h in ("Date", "From", "To", "Cc", "Subject"):
+        if header(msg, h):
+            print(f"{h}: {header(msg, h)}")
+    if files:
+        print("첨부: " + ", ".join(files))
+    print("\n" + (text[:limit] + ("\n…(잘림, --max 로 늘리기)" if len(text) > limit else "")))
+
+
+def cmd_mail_read(a):
+    print_message(http("GET", f"{GMAIL}/messages/{a.id}?format=full", token=token()), a.max)
+    return 0
+
+
+def cmd_mail_thread(a):
+    th = http("GET", f"{GMAIL}/threads/{a.id}?format=full", token=token())
+    for i, msg in enumerate(th.get("messages", [])):
+        if i:
+            print("\n" + "─" * 60)
+        print_message(msg, a.max)
+    return 0
+
+
+def approve(req):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(60)
+        s.connect(SOCK)
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode())
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except (FileNotFoundError, PermissionError, ConnectionRefusedError) as err:
+        raise Fail(f"확인 서비스에 연결할 수 없습니다 ({type(err).__name__}). 이 봇에 발송 권한이 설정되지 않았을 수 있습니다.") from None
+    finally:
+        s.close()
+    resp = json.loads(data.decode() or "{}")
+    if not resp.get("ok"):
+        raise Fail(resp.get("error") or "확인 서비스 오류")
+    return resp
+
+
+def cmd_mail_send(a):
+    payload = {"to": a.to, "cc": a.cc or "", "subject": a.subject, "body": a.body.replace("\\n", "\n")}
+    if a.reply_to:
+        orig = http("GET", f"{GMAIL}/messages/{a.reply_to}?format=metadata&metadataHeaders=Message-ID"
+                           f"&metadataHeaders=Subject", token=token())
+        payload["thread_id"] = orig.get("threadId", "")
+        payload["in_reply_to"] = header(orig, "Message-ID")
+    r = approve({"op": "request", "action": "mail.send", "payload": payload})
+    print(f"요청 #{r['id']} — 사람에게 내용과 승인 코드를 보냈습니다 ({r['expires_in_min']}분 유효).\n"
+          f"사람이 코드를 알려 주면: ai-google mail confirm {r['id']} <코드>")
+    return 0
+
+
+def cmd_mail_confirm(a):
+    print(approve({"op": "confirm", "id": a.id, "code": a.code})["message"])
+    return 0
+
+
+def cmd_mail_cancel(a):
+    print(approve({"op": "cancel", "id": a.id})["message"])
+    return 0
+
+
+def cmd_mail_pending(_a):
+    items = approve({"op": "list"})["pending"]
+    if not items:
+        print("(대기 중인 요청 없음)")
+    for i in items:
+        print(f"#{i['id']} {i['action']} 만료 {i['expires'][:16]}Z\n  {i['summary'].splitlines()[0]}")
+    return 0
+
+
+# ───────────────────────────── 캘린더 ─────────────────────────────
+
+def parse_when(text):
+    text = text.strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(text, fmt).replace(tzinfo=TZ), fmt == "%Y-%m-%d"
+        except ValueError:
+            continue
+    raise Fail(f"시각 형식: '2026-11-03 15:00' 또는 '2026-11-03' (받은 값: {text})")
+
+
+def ev_time(e):
+    s = e.get("start", {})
+    return s.get("dateTime", s.get("date", ""))
+
+
+def cmd_cal_list(a):
+    start = parse_when(a.start)[0] if a.start else dt.datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + dt.timedelta(days=a.days)
+    q = urllib.parse.urlencode({"timeMin": start.isoformat(), "timeMax": end.isoformat(), "singleEvents": "true",
+                                "orderBy": "startTime", "maxResults": 100, "timeZone": str(TZ)})
+    items = http("GET", f"{CAL}/events?{q}", token=token()).get("items") or []
+    if not items:
+        print("(일정 없음)")
+    for e in items:
+        when = ev_time(e).replace("T", " ")[:16]
+        loc = f"  @{e['location']}" if e.get("location") else ""
+        print(f"{when:16}  {e.get('summary', '(제목 없음)')}{loc}  [{e['id']}]")
+    return 0
+
+
+def event_body(a, creating):
+    body = {}
+    if a.title is not None:
+        body["summary"] = a.title[:250]
+    if a.location is not None:
+        body["location"] = a.location
+    if a.desc is not None:
+        body["description"] = a.desc.replace("\\n", "\n")
+    if a.start:
+        start, date_only = parse_when(a.start)
+        if getattr(a, "all_day", False) or date_only:
+            end = parse_when(a.end)[0] if a.end else start
+            body["start"] = {"date": start.date().isoformat()}
+            body["end"] = {"date": (end.date() + dt.timedelta(days=1)).isoformat()}
+        else:
+            end = parse_when(a.end)[0] if a.end else start + dt.timedelta(minutes=getattr(a, "minutes", None) or 60)
+            if end <= start:
+                raise Fail("끝 시각이 시작보다 빠릅니다")
+            body["start"] = {"dateTime": start.isoformat(), "timeZone": str(TZ)}
+            body["end"] = {"dateTime": end.isoformat(), "timeZone": str(TZ)}
+    elif a.end:
+        raise Fail("--end 를 바꿀 때는 --start 도 함께 주세요")
+    if creating and ("summary" not in body or "start" not in body):
+        raise Fail("--title 과 --start 는 필수입니다")
+    return body
+
+
+def cmd_cal_add(a):
+    e = http("POST", f"{CAL}/events?sendUpdates=none", event_body(a, True), token=token())
+    print(f"일정 추가: {ev_time(e).replace('T', ' ')[:16]} {e.get('summary')}  [{e['id']}]")
+    return 0
+
+
+def cmd_cal_update(a):
+    body = event_body(a, False)
+    if not body:
+        raise Fail("바꿀 항목이 없습니다")
+    e = http("PATCH", f"{CAL}/events/{urllib.parse.quote(a.id)}?sendUpdates=none", body, token=token())
+    print(f"일정 수정: {ev_time(e).replace('T', ' ')[:16]} {e.get('summary')}  [{e['id']}]")
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="ai-google")
+    top = p.add_subparsers(dest="area", required=True)
+    mail = top.add_parser("mail").add_subparsers(dest="cmd", required=True)
+    s = mail.add_parser("search")
+    s.add_argument("query")
+    s.add_argument("--limit", type=int, default=10)
+    s.set_defaults(fn=cmd_mail_search)
+    for name, fn in (("read", cmd_mail_read), ("thread", cmd_mail_thread)):
+        s = mail.add_parser(name)
+        s.add_argument("id")
+        s.add_argument("--max", type=int, default=6000)
+        s.set_defaults(fn=fn)
+    s = mail.add_parser("send")
+    s.add_argument("--to", required=True)
+    s.add_argument("--cc")
+    s.add_argument("--subject", required=True)
+    s.add_argument("--body", required=True)
+    s.add_argument("--reply-to", dest="reply_to")
+    s.set_defaults(fn=cmd_mail_send)
+    s = mail.add_parser("confirm")
+    s.add_argument("id")
+    s.add_argument("code")
+    s.set_defaults(fn=cmd_mail_confirm)
+    s = mail.add_parser("cancel")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_mail_cancel)
+    mail.add_parser("pending").set_defaults(fn=cmd_mail_pending)
+    cal = top.add_parser("cal").add_subparsers(dest="cmd", required=True)
+    s = cal.add_parser("list")
+    s.add_argument("--days", type=int, default=7)
+    s.add_argument("--from", dest="start")
+    s.set_defaults(fn=cmd_cal_list)
+    for name, fn in (("add", cmd_cal_add), ("update", cmd_cal_update)):
+        s = cal.add_parser(name)
+        if name == "update":
+            s.add_argument("id")
+        s.add_argument("--title")
+        s.add_argument("--start")
+        s.add_argument("--end")
+        s.add_argument("--location")
+        s.add_argument("--desc")
+        if name == "add":
+            s.add_argument("--minutes", type=int)
+            s.add_argument("--all-day", dest="all_day", action="store_true")
+        s.set_defaults(fn=fn)
+    a = p.parse_args(argv)
+    try:
+        return a.fn(a)
+    except Fail as err:
+        print(f"❌ {err}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

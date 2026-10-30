@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""ai-team-deploy — GitHub 저장소를 가져와 VM 에 배포 (root, ai-team-deploy.timer 가 5분마다 실행)
+
+GitHub 은 VM 에 접근하지 않는다. VM 이 가져간다.
+  코드 저장소(공개)  : 프로그램·유닛·봇 템플릿. main 의 새 커밋이 CI 를 통과했을 때만 설치.
+  설정 저장소(비공개): 봇 정의·team-config·프로젝트 브리프. 양방향 동기화
+                       (서버에서 바뀐 설정 → 커밋·push, 저장소에서 바뀐 설정 → 서버에 반영).
+  토큰·비밀값은 어느 저장소에도 넣지 않는다 (sudo ai-bot secret … 으로 서버에서만).
+
+  ai-team-deploy plan        무엇이 바뀔지 보기만 (아무것도 바꾸지 않음)
+  ai-team-deploy run         한 번 배포 (자동 배포가 꺼져 있으면 아무것도 안 함)
+  ai-team-deploy run --force 자동 배포가 꺼져 있어도 지금 한 번 배포
+  ai-team-deploy enable      자동 배포 켜기 (타이머)        · disable 끄기
+  ai-team-deploy status      배포된 버전·최근 기록
+  ai-team-deploy rollback    직전 배포로 되돌리기
+
+설정: /etc/ai-team/deploy.yaml · 상태: /var/lib/ai-team/deploy/
+"""
+import argparse
+import datetime as dt
+import filecmp
+import fnmatch
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+import yaml
+
+CONF_PATH = os.environ.get("AI_TEAM_DEPLOY_CONF", "/etc/ai-team/deploy.yaml")
+STATE = os.environ.get("AI_TEAM_DEPLOY_STATE", "/var/lib/ai-team/deploy")
+ETC = os.environ.get("AI_BOT_ETC", "/etc/ai-team")
+PROJ = os.environ.get("AI_TEAM_PROJECTS", "/etc/ai-team-projects")
+BROWSER_LIB = "/usr/local/lib/ai-team/playwright-mcp"
+DISPATCHER_DIR = "/opt/ai-team"
+
+# 설정 저장소 경로 ↔ 서버 경로 (비밀값 파일은 절대 넣지 않음)
+CONFIG_MAP = [
+    ("team-config.yaml", f"{ETC}/team-config.yaml", 0o600),
+    ("bots/*/bot.yaml", f"{ETC}/bots.d/*/bot.yaml", 0o600),
+    ("bots/*/settings.json", f"{ETC}/bots.d/*/settings.json", 0o600),
+    ("projects/*.md", f"{PROJ}/*.md", 0o644),
+]
+CONFIG_SKIP = ["INDEX.md"]            # 자동 생성 파일
+SECRET_HINTS = ("TOKEN=", "SECRET=", "PASSWORD=", "sk-ant-", "refresh_token")
+
+
+class Fail(Exception):
+    pass
+
+
+# ───────────────────────────── 공통 ─────────────────────────────
+
+def now():
+    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(msg):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    line = f"{now()} {msg}"
+    print(line, flush=True)
+    with open(os.path.join(STATE, "deploy.log"), "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def sh(cmd, cwd=None, check=True, env=None, timeout=600):
+    res = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, env=env, timeout=timeout)
+    if check and res.returncode != 0:
+        raise Fail(f"{' '.join(cmd[:4])} … 실패: {(res.stderr or res.stdout).strip()[-400:]}")
+    return res
+
+
+def conf():
+    try:
+        with open(CONF_PATH, encoding="utf-8") as fh:
+            c = yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        raise Fail(f"{CONF_PATH} 가 없습니다 (부트스트랩 스크립트를 먼저 실행)") from None
+    c.setdefault("branch", "main")
+    c.setdefault("src_dir", "/var/lib/ai-team/src")
+    c.setdefault("require_ci", True)
+    c.setdefault("restart_bots", True)
+    return c
+
+
+def state_get(name, default=None):
+    try:
+        with open(os.path.join(STATE, name), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except FileNotFoundError:
+        return default
+
+
+def state_set(name, value):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    with open(os.path.join(STATE, name), "w", encoding="utf-8") as fh:
+        fh.write(value + "\n")
+
+
+def notify(text):
+    try:
+        sys.path.insert(0, DISPATCHER_DIR)
+        import dispatcher  # noqa: E402
+        dispatcher.notify(dispatcher.load_config(), text)
+    except Exception as err:  # noqa: BLE001 — 알림 실패가 배포를 막으면 안 됨
+        log(f"알림 실패: {type(err).__name__}: {err}")
+
+
+def git(repo_dir, *args, key=None, check=True):
+    env = dict(os.environ)
+    if key:
+        env["GIT_SSH_COMMAND"] = f"ssh -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+    return sh(["git", "-C", repo_dir, *args], env=env, check=check)
+
+
+# ───────────────────────────── 코드 저장소 ─────────────────────────────
+
+def code_dir(c):
+    return os.path.join(c["src_dir"], "code")
+
+
+def code_fetch(c):
+    d = code_dir(c)
+    if not os.path.isdir(os.path.join(d, ".git")):
+        os.makedirs(c["src_dir"], mode=0o700, exist_ok=True)
+        sh(["git", "clone", "--branch", c["branch"], c["code_repo"], d])
+    git(d, "fetch", "--quiet", "origin", c["branch"])
+    return git(d, "rev-parse", f"origin/{c['branch']}").stdout.strip()
+
+
+def ci_state(c, sha):
+    """공개 저장소의 GitHub 검사 결과: success | pending | failure | none (인증 없이 조회)."""
+    slug = c["code_repo"].rstrip("/").removesuffix(".git").split("github.com/")[-1]
+    req = urllib.request.Request(f"https://api.github.com/repos/{slug}/commits/{sha}/check-runs?per_page=50",
+                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "ai-team-deploy"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            runs = json.load(resp).get("check_runs", [])
+    except (urllib.error.URLError, TimeoutError) as err:
+        raise Fail(f"GitHub 검사 결과 조회 실패: {err}") from None
+    if not runs:
+        return "none"
+    if any(r.get("status") != "completed" for r in runs):
+        return "pending"
+    bad = [r["name"] for r in runs if r.get("conclusion") not in ("success", "skipped", "neutral")]
+    return "failure:" + ",".join(bad) if bad else "success"
+
+
+def manifest(tree):
+    rows = []
+    with open(os.path.join(tree, "deploy", "manifest.tsv"), encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip() and not line.startswith("#"):
+                group, src, dst, mode = line.rstrip("\n").split("\t")
+                if group == "browser" and not os.path.isdir(BROWSER_LIB):
+                    continue
+                rows.append((src, dst, int(mode, 8)))
+    return rows
+
+
+def checkout(c, sha):
+    """배포할 커밋을 별도 폴더로 꺼냄 (작업 사본은 건드리지 않음)."""
+    out = os.path.join(c["src_dir"], "release")
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    arch = subprocess.run(["git", "-C", code_dir(c), "archive", sha], capture_output=True, check=True).stdout
+    subprocess.run(["tar", "-x", "-C", out], input=arch, check=True)
+    return out
+
+
+def code_changes(tree):
+    return [(src, dst, mode) for src, dst, mode in manifest(tree)
+            if not (os.path.exists(dst) and filecmp.cmp(os.path.join(tree, src), dst, shallow=False))]
+
+
+def syntax_check(tree):
+    for src, _dst, _mode in manifest(tree):
+        p = os.path.join(tree, src)
+        first = open(p, "rb").readline()
+        if src.endswith(".py") or b"python" in first:
+            sh([sys.executable, "-m", "py_compile", p])
+        elif src.endswith(".js"):
+            sh(["node", "--check", p])
+        elif b"sh" in first:
+            sh(["bash", "-n", p])
+
+
+def install_files(changes, tree, backup_dir):
+    os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+    for src, dst, mode in changes:
+        if os.path.exists(dst):
+            keep = os.path.join(backup_dir, dst.lstrip("/"))
+            os.makedirs(os.path.dirname(keep), exist_ok=True)
+            shutil.copy2(dst, keep)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = dst + ".deploy-tmp"
+        shutil.copyfile(os.path.join(tree, src), tmp)
+        os.chmod(tmp, mode)
+        os.chown(tmp, 0, 0)
+        os.replace(tmp, dst)
+
+
+def restore(backup_dir, changed_dsts):
+    for dst in changed_dsts:
+        keep = os.path.join(backup_dir, dst.lstrip("/"))
+        if os.path.exists(keep):
+            shutil.copy2(keep, dst)
+        elif os.path.exists(dst):
+            os.unlink(dst)      # 새로 생긴 파일은 지움
+
+
+# ───────────────────────────── 설정 저장소 (양방향) ─────────────────────────────
+
+def cfg_dir(c):
+    return os.path.join(c["src_dir"], "config")
+
+
+def _star(pattern, path):
+    """패턴의 * 자리에 해당하는 이름 (bots/*/bot.yaml → 봇 이름, projects/*.md → 키)."""
+    parts_p, parts = pattern.split("/"), path.split("/")[-len(pattern.split("/")):]
+    for pp, part in zip(parts_p, parts):
+        if "*" in pp:
+            pre, post = pp.split("*", 1)
+            return part[len(pre):len(part) - len(post) if post else None]
+    return None
+
+
+def config_pairs(repo):
+    """(저장소 파일, 서버 파일, 권한) — 양쪽 중 한쪽에라도 있는 것을 모두 모음."""
+    pairs = {}
+    for rpat, spat, mode in CONFIG_MAP:
+        for sp in glob.glob(spat):
+            name = _star(spat, sp)
+            pairs[os.path.join(repo, rpat.replace("*", name, 1) if name else rpat)] = (sp, mode)
+        for rp in glob.glob(os.path.join(repo, rpat)):
+            name = _star(rpat, os.path.relpath(rp, repo))
+            pairs.setdefault(rp, (spat.replace("*", name, 1) if name else spat, mode))
+    return [(rp, sp, mode) for rp, (sp, mode) in sorted(pairs.items())
+            if not any(fnmatch.fnmatch(os.path.basename(rp), s) for s in CONFIG_SKIP)]
+
+
+def looks_secret(path):
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except FileNotFoundError:
+        return False
+    return any(h in text for h in SECRET_HINTS)
+
+
+def config_fetch(c):
+    d = cfg_dir(c)
+    key = c["config_key"]
+    if not os.path.isdir(os.path.join(d, ".git")):
+        os.makedirs(c["src_dir"], mode=0o700, exist_ok=True)
+        env = dict(os.environ, GIT_SSH_COMMAND=f"ssh -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new")
+        sh(["git", "clone", c["config_repo"], d], env=env)
+        git(d, "config", "user.name", "ai-team-deploy (VM)")
+        git(d, "config", "user.email", "ai-team-deploy@vm.local")
+    git(d, "fetch", "--quiet", "origin", key=key, check=False)
+    return d
+
+
+def file_text(path):
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def server_changes(c, d):
+    """마지막 동기화 이후 서버에서 바뀐 설정 [(저장소 파일, 서버 파일, 내용)]. 첫 동기화면 서버 전부."""
+    last = state_get("config-synced")
+    out = []
+    for rp, sp, _mode in config_pairs(d):
+        if not os.path.exists(sp):
+            continue
+        if looks_secret(sp):
+            log(f"⚠️ 비밀값처럼 보여 저장소에 올리지 않음: {sp}")
+            continue
+        text = file_text(sp)
+        rel = os.path.relpath(rp, d)
+        before = git(d, "show", f"{last}:{rel}", check=False) if last else None
+        if before is None or before.returncode != 0 or before.stdout != text:
+            out.append((rp, sp, text))
+    return out
+
+
+def config_sync(c, dry=False):
+    """서버 변경 → 커밋·push, 저장소 변경 → 서버 반영. 서버에 반영한 경로 목록을 돌려준다."""
+    d = config_fetch(c)
+    key, branch = c["config_key"], c["branch"]
+    remote = git(d, "rev-parse", "--verify", "--quiet", f"origin/{branch}", check=False).returncode == 0
+    local = git(d, "rev-parse", "--verify", "--quiet", "HEAD", check=False).returncode == 0
+    if not local:
+        if remote:
+            git(d, "checkout", "--quiet", "-B", branch, f"origin/{branch}")
+        else:
+            git(d, "checkout", "--quiet", "--orphan", branch, check=False)
+    exported = server_changes(c, d)
+    if dry:
+        return {"server_to_repo": [sp for _rp, sp, _t in exported], "repo_to_server": config_incoming(c, d)}
+    for rp, _sp, text in exported:
+        os.makedirs(os.path.dirname(rp), exist_ok=True)
+        with open(rp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    git(d, "add", "-A")
+    if git(d, "status", "--porcelain").stdout.strip():
+        git(d, "commit", "--quiet", "-m", "vm: 서버에서 바뀐 설정 반영\n\n" +
+            "\n".join(f"- {sp}" for _rp, sp, _t in exported))
+        log(f"설정 서버→저장소 커밋: {len(exported)}개")
+    if remote and git(d, "rebase", "--quiet", f"origin/{branch}", check=False).returncode != 0:
+        git(d, "rebase", "--abort", check=False)
+        raise Fail("설정 저장소 충돌 — 서버와 저장소에서 같은 부분을 고쳤습니다. 저장소에서 정리해 주세요.")
+    if git(d, "rev-parse", "--verify", "--quiet", "HEAD", check=False).returncode != 0:
+        return []
+    ahead = git(d, "rev-list", "--count", f"origin/{branch}..HEAD", check=False).stdout.strip() if remote else "1"
+    if ahead not in ("", "0"):
+        git(d, "push", "--quiet", "origin", f"HEAD:{branch}", key=key)
+    applied = []
+    for rp, sp, mode in config_pairs(d):
+        if not os.path.exists(rp) or looks_secret(rp):
+            continue
+        text = file_text(rp)
+        if os.path.exists(sp) and file_text(sp) == text:
+            continue
+        os.makedirs(os.path.dirname(sp), mode=0o700, exist_ok=True)
+        tmp = sp + ".deploy-tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, sp)
+        applied.append(sp)
+    state_set("config-synced", git(d, "rev-parse", "HEAD").stdout.strip())
+    if applied:
+        log(f"설정 저장소→서버 반영: {', '.join(applied)}")
+    return applied
+
+
+def config_incoming(c, d):
+    branch = c["branch"]
+    if git(d, "rev-parse", "--verify", "--quiet", f"origin/{branch}", check=False).returncode != 0:
+        return []
+    out = []
+    for rp, sp, _mode in config_pairs(d):
+        rel = os.path.relpath(rp, d)
+        res = git(d, "show", f"origin/{branch}:{rel}", check=False)
+        if res.returncode == 0 and (not os.path.exists(sp) or open(sp, encoding="utf-8").read() != res.stdout):
+            out.append(sp)
+    return out
+
+
+# ───────────────────────────── 적용·점검 ─────────────────────────────
+
+def enabled_bots():
+    out = []
+    for y in sorted(glob.glob(f"{ETC}/bots.d/*/bot.yaml")):
+        cfg = yaml.safe_load(open(y, encoding="utf-8")) or {}
+        if cfg.get("enabled", True) is not False:
+            out.append((os.path.basename(os.path.dirname(y)), cfg))
+    return out
+
+
+def apply_system(units_changed, restart):
+    if units_changed:
+        sh(["systemctl", "daemon-reload"])
+    sh(["/usr/local/sbin/ai-bot", "init", "--skip-binaries"], timeout=300)
+    sh(["/usr/local/sbin/ai-team-update-instructions"], timeout=300)
+    res = sh(["/usr/local/sbin/ai-bot", "apply", "--no-start"], check=False, timeout=900)
+    if res.returncode != 0:
+        log(f"ai-bot apply 경고: {(res.stdout + res.stderr)[-400:]}")
+    if restart:
+        for name, cfg in enabled_bots():
+            if cfg.get("telegram", True) and sh(["systemctl", "is-enabled", "--quiet", f"ai-bot@{name}"],
+                                                 check=False).returncode == 0:
+                sh(["systemctl", "restart", f"ai-bot@{name}"], check=False)
+
+
+def health():
+    """배포 후 점검. 문제 목록 (빈 목록이면 정상)."""
+    time.sleep(20)
+    problems = []
+    for name, cfg in enabled_bots():
+        if cfg.get("telegram", True) and sh(["systemctl", "is-enabled", "--quiet", f"ai-bot@{name}"],
+                                             check=False).returncode == 0:
+            if sh(["systemctl", "is-active", "--quiet", f"ai-bot@{name}"], check=False).returncode != 0:
+                problems.append(f"봇 {name} 이 실행 중이 아님")
+        if cfg.get("browser") and sh(["systemctl", "is-active", "--quiet", f"ai-chrome@{name}"],
+                                     check=False).returncode != 0:
+            problems.append(f"{name} 상시 브라우저가 실행 중이 아님")
+    for unit in ("ai-approve.socket", "ai-bot-watchdog.timer"):
+        if sh(["systemctl", "is-active", "--quiet", unit], check=False).returncode != 0:
+            problems.append(f"{unit} 비활성")
+    res = sh([sys.executable, f"{DISPATCHER_DIR}/dispatcher.py", "--help"], check=False)
+    if res.returncode != 0:
+        problems.append("디스패처 실행 오류")
+    return problems
+
+
+def summarize_commits(c, old, new):
+    if not old:
+        return ""
+    res = git(code_dir(c), "log", "--no-merges", "--format=- %s", f"{old}..{new}", check=False)
+    lines = [l for l in res.stdout.splitlines() if l.strip()][:6]
+    return "\n".join(lines)
+
+
+# ───────────────────────────── 명령 ─────────────────────────────
+
+def cmd_plan(_a):
+    c = conf()
+    sha = code_fetch(c)
+    cur = state_get("code-deployed")
+    print(f"코드: 배포됨 {cur[:8] if cur else '(없음)'} → 원격 {sha[:8]}  CI: {ci_state(c, sha) if c['require_ci'] else '확인 안 함'}")
+    tree = checkout(c, sha)
+    ch = code_changes(tree)
+    print(f"바뀌는 프로그램·유닛 {len(ch)}개" + ("".join(f"\n  - {dst}" for _s, dst, _m in ch) if ch else ""))
+    if c.get("config_repo"):
+        r = config_sync(c, dry=True)
+        print(f"설정 서버→저장소 {len(r['server_to_repo'])}개" + "".join(f"\n  - {p}" for p in r["server_to_repo"]))
+        print(f"설정 저장소→서버 {len(r['repo_to_server'])}개" + "".join(f"\n  - {p}" for p in r["repo_to_server"]))
+    print(f"자동 배포: {'켜짐' if state_get('enabled') == 'yes' else '꺼짐 (sudo ai-team-deploy enable)'}")
+    return 0
+
+
+def lock():
+    import fcntl
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    fh = open(os.path.join(STATE, ".lock"), "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Fail("다른 배포가 진행 중입니다") from None
+    return fh
+
+
+def cmd_run(a):
+    if state_get("enabled") != "yes" and not a.force:
+        return 0
+    c = conf()
+    _l = lock()
+    applied_cfg = []
+    if c.get("config_repo"):
+        try:
+            applied_cfg = config_sync(c)
+        except Fail as err:
+            if state_get("last-config-error") != str(err):
+                notify(f"⚠️ 설정 동기화 실패\n{err}")
+                state_set("last-config-error", str(err))
+            log(f"설정 동기화 실패: {err}")
+        else:
+            state_set("last-config-error", "")
+    sha = code_fetch(c)
+    cur = state_get("code-deployed")
+    code_new = sha != cur
+    if code_new and c["require_ci"]:
+        ci = ci_state(c, sha)
+        if ci != "success":
+            if ci.startswith("failure") and state_get("last-ci-fail") != sha:
+                notify(f"⛔ 배포 보류 {sha[:8]} — CI 실패 ({ci.split(':', 1)[-1]})")
+                state_set("last-ci-fail", sha)
+            log(f"코드 {sha[:8]} 배포 대기 (CI {ci})")
+            code_new = False
+    if not code_new and not applied_cfg:
+        return 0
+    changes, backup = [], None
+    if code_new:
+        tree = checkout(c, sha)
+        syntax_check(tree)
+        changes = code_changes(tree)
+        backup = os.path.join(STATE, "releases", (cur or "initial")[:12])
+        install_files(changes, tree, backup)
+        log(f"코드 {(cur or '')[:8]} → {sha[:8]}: 파일 {len(changes)}개 설치")
+    units = any(dst.startswith("/etc/systemd/") for _s, dst, _m in changes)
+    try:
+        apply_system(units, c["restart_bots"])
+        problems = health()
+    except Fail as err:
+        problems = [str(err)]
+    if problems and changes:
+        restore(backup, [dst for _s, dst, _m in changes])
+        try:
+            apply_system(units, c["restart_bots"])
+        except Fail as err:
+            log(f"되돌린 뒤 적용 오류: {err}")
+        notify(f"↩️ 배포 {sha[:8]} 되돌림\n" + "\n".join(f"• {p}" for p in problems[:6]))
+        log(f"배포 {sha[:8]} 되돌림: {problems}")
+        state_set("last-ci-fail", sha)      # 같은 커밋을 다시 시도하지 않음
+        state_set("code-deployed", cur or "")
+        return 1
+    if code_new:
+        state_set("code-previous", cur or "")
+        state_set("code-deployed", sha)
+    msg = [f"🚀 배포 완료 {sha[:8]}" if code_new else "🔧 설정 반영 완료"]
+    if code_new:
+        commits = summarize_commits(c, cur, sha)
+        if commits:
+            msg.append(commits)
+        msg.append(f"프로그램 {len(changes)}개 갱신")
+    if applied_cfg:
+        msg.append(f"설정 {len(applied_cfg)}개 반영")
+    msg.append("점검 ✅" if not problems else "점검 ⚠️ " + "; ".join(problems[:3]))
+    notify("\n".join(msg))
+    return 0
+
+
+def cmd_rollback(_a):
+    c = conf()
+    prev = state_get("code-previous")
+    if not prev:
+        raise Fail("되돌릴 이전 배포가 없습니다")
+    _l = lock()
+    code_fetch(c)
+    tree = checkout(c, prev)
+    changes = code_changes(tree)
+    install_files(changes, tree, os.path.join(STATE, "releases", "rollback-" + dt.datetime.now().strftime("%Y%m%d%H%M%S")))
+    apply_system(any(d.startswith("/etc/systemd/") for _s, d, _m in changes), c["restart_bots"])
+    cur = state_get("code-deployed")
+    state_set("code-deployed", prev)
+    state_set("last-ci-fail", cur or "")     # 되돌린 커밋을 자동으로 다시 배포하지 않음
+    notify(f"↩️ 수동 되돌림 → {prev[:8]} (파일 {len(changes)}개)")
+    print(f"되돌림 완료 → {prev[:8]}")
+    return 0
+
+
+def cmd_enable(_a):
+    state_set("enabled", "yes")
+    sh(["systemctl", "enable", "--now", "ai-team-deploy.timer"])
+    print("✅ 자동 배포 켜짐 (5분마다 확인)")
+    return 0
+
+
+def cmd_disable(_a):
+    state_set("enabled", "no")
+    print("⏸ 자동 배포 꺼짐 (타이머는 돌지만 아무것도 하지 않음)")
+    return 0
+
+
+def cmd_status(_a):
+    print(f"자동 배포: {'켜짐' if state_get('enabled') == 'yes' else '꺼짐'}")
+    print(f"코드 배포: {(state_get('code-deployed') or '(없음)')[:12]}  (직전 {(state_get('code-previous') or '-')[:12]})")
+    print(f"설정 동기화: {(state_get('config-synced') or '(없음)')[:12]}")
+    try:
+        with open(os.path.join(STATE, "deploy.log"), encoding="utf-8") as fh:
+            print("최근 기록:\n" + "".join(fh.readlines()[-10:]))
+    except FileNotFoundError:
+        pass
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="ai-team-deploy")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("plan", "enable", "disable", "status", "rollback"):
+        sub.add_parser(name)
+    s = sub.add_parser("run")
+    s.add_argument("--force", action="store_true")
+    a = p.parse_args(argv)
+    if os.geteuid() != 0:
+        sys.exit("root 권한이 필요합니다: sudo ai-team-deploy …")
+    try:
+        return {"plan": cmd_plan, "run": cmd_run, "enable": cmd_enable, "disable": cmd_disable,
+                "status": cmd_status, "rollback": cmd_rollback}[a.cmd](a) or 0
+    except Fail as err:
+        log(f"❌ {err}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

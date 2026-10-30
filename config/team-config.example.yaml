@@ -1,0 +1,80 @@
+# AI Team 디스패처 설정 — /etc/ai-team/team-config.yaml (root 600)
+# 비밀 값은 넣지 않습니다. Jira 토큰은 jira.env, 봇 토큰은 각 봇 사용자 홈에만 있습니다.
+# 봇 목록·권한은 /etc/ai-team/bots.d/<봇>/bot.yaml 에서 정합니다 (sudo ai-bot …).
+# 이 파일은 매 tick(1분)마다 다시 읽으므로 고친 뒤 재시작이 필요 없습니다.
+
+timezone: Asia/Seoul
+
+# 봇 지침에서 나를 부르는 이름 (ai-team-update-instructions 가 사용)
+owner_name: "<이름>"
+
+# 처음엔 true 로 두고 `sudo python3 /opt/ai-team/dispatcher.py tick --dry-run` 로 확인한 뒤 false 로.
+dry_run: true
+
+jira:
+  env_file: /etc/ai-team/jira.env
+  site: https://<사이트>.atlassian.net
+  project_key: TEAM
+  # ↓ 아래 ID 들은 `sudo python3 /opt/ai-team/jira-setup.py` 가 출력해 주는 값으로 바꾸세요
+  task_type_id: "10003"
+  fields:
+    agent:      customfield_10047
+    product:    customfield_10046
+    window:     customfield_10045
+    run_at:     customfield_10051
+    max_turns:  customfield_10050
+    usage:      customfield_10049
+    session_id: customfield_10048
+  statuses:            # 표시 이름은 언어마다 달라서 ID 로만 다룹니다
+    todo:        "10000"
+    scheduled:   "10004"
+    in_progress: "3"
+    paused:      "10005"
+    review:      "10001"
+    done:        "10003"
+    failed:      "10006"
+
+# 알림은 leader 봇 토큰으로 '보내기'만 합니다. leader 가 outbox 에 쓴 요청 파일을 디스패처가 처리합니다.
+telegram:
+  env_file: /home/bot-leader/.claude/channels/telegram-leader/.env
+  chat_id: "<내 Telegram 사용자 ID>"
+  outbox: /home/bot-leader/bots/leader/outbox
+
+# 승인형 관리 명령: 내 Jira 계정이 Scheduled 로 옮긴 관리 요청만 root 로 실행
+admin:
+  approver_account_id: "<jira-setup.py 가 출력한 내 계정 ID>"
+  label: admin-request
+  timeout_minutes: 20
+  resume_related: true
+
+# Window 필드: Night = 야간 창 안에서만(비어 있으면 Night) · ASAP = 언제든 · Weekend = 토·일만
+# Run At 은 어느 경우든 "이 시각 이전에는 시작하지 않음"
+windows:
+  night:
+    start: "01:00"
+    end:   "07:00"
+
+max_concurrent:
+  night: 1
+  day:   1
+
+budget:
+  # 한 사이클(야간 시작 ~ 다음 야간 시작) 사용량 상한. 단위는 Claude 가 보고하는 total_cost_usd.
+  # 구독 요금제에서는 실제 청구액이 아니라 상대적인 소모량 지표입니다.
+  per_cycle: 20.0
+  rate_limit_backoff_minutes: 60
+
+# 프로젝트(Product)별 사용량 분배 비율. 할당 대비 덜 쓴 프로젝트 작업부터 실행.
+products:
+  OPS: 1.0     # 팀 운영·인프라·실험
+  # APP: 0.6   # 제품 프로젝트 예시 — 추가하면 비율 합이 1 이 되게 조정
+default_product: OPS
+
+# 프로젝트 목록(INDEX.md)·브리프(<Product>.md) 폴더 — root 소유, 봇은 읽기만. 새 작업 프롬프트에는 해당 Product 브리프만 주입
+context_dir: /etc/ai-team-projects
+
+# 작업 하나의 최대 실행 시간(분). 넘으면 Paused.
+max_runtime_minutes: 180
+
+# 잠금 파일·사용량 장부(usage.jsonl)·재예약 메모
+state_dir: /var/lib/ai-team

@@ -1,0 +1,10 @@
+# GitHub 저장소(코드: 공개, 설정: 비공개)를 가져와 배포 — VM 이 가져가는 방식 (GitHub 은 VM 에 접근하지 않음)
+[Unit]
+Description=AI 팀 자동 배포
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ai-team-deploy run
+TimeoutStartSec=15min

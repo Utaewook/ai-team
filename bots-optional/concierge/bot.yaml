@@ -1,0 +1,16 @@
+# concierge 봇 정의 — 웹 사이트 담당 (브라우저). 고친 뒤 sudo ai-bot apply concierge
+enabled: true
+description: 웹 사이트 담당 — 채용·커리어 사이트 조회·정리·작성 (브라우저, 저장·제출은 승인 후)
+model: sonnet
+telegram: true
+docker: false
+github: false
+writable: [notes]
+browser:
+  display: 50
+  allow: [saramin.co.kr, groupby.kr, rememberapp.co.kr]
+  relogin: [saramin]        # 40분마다 로그인 확인·세션 유지, 풀리면 소셜 버튼으로 재로그인 (relogin-sites.json 의 사이트)
+  keepalive_minutes: 40
+dispatch:
+  work_in_repo: false
+  extra_args: []

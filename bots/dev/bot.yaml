@@ -1,0 +1,19 @@
+# dev 봇 정의 — 고친 뒤 sudo ai-bot apply dev
+enabled: true
+description: 개발 — 코드 작업, 테스트, develop 푸시·PR
+model: sonnet
+telegram: true
+docker: true                 # rootless Docker (bot-dev 전용)
+github:                      # GitHub 토큰 등록 시 범위 검사 (토큰은 코드 레포만 허용해서 발급)
+  must_see: []               # 예: [<계정>/<제품 레포>]
+  must_not_see: []           # 예: [<계정>/<볼트 저장소>]  ← 보이면 토큰 등록 거부
+repos:                       # Product → 홈 기준 경로. 디스패처가 이 레포 안에서 dev 작업 실행
+  OPS: projects/sandbox
+  # APP: projects/<제품 레포>
+git: {name: "AI Dev", email: "ai-dev@bots.local"}
+dispatch:
+  work_in_repo: true
+  extra_args: ["--permission-mode", "auto",
+               "--disallowedTools", "Bash(git push --force *)", "Bash(git push -f *)",
+               "Bash(git push origin main *)", "Bash(git push origin master *)",
+               "Bash(git push origin HEAD:main *)", "Bash(sudo *)"]

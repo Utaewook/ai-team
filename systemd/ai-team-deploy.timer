@@ -1,0 +1,10 @@
+[Unit]
+Description=AI 팀 자동 배포 (5분마다 새 커밋 확인)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""ai-browser-keepalive — 상시 브라우저에서 사이트를 잠깐 열었다 닫아 로그인 세션 유휴 만료를 늦춤
+ai-browser-keepalive@<봇>.timer 가 봇 사용자로 실행. 환경: AI_CDP_PORT, AI_KEEPALIVE(공백 구분 https URL),
+AI_RELOGIN(공백 구분 사이트 이름 — 로그인 확인 겸 세션 유지, 풀려 있으면 소셜 버튼으로 다시 로그인)
+별도 탭을 15초 열었다 닫을 뿐이라 봇이 쓰던 탭은 건드리지 않는다."""
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+PORT = os.environ.get("AI_CDP_PORT", "")
+URLS = [u for u in os.environ.get("AI_KEEPALIVE", "").split() if u.startswith("https://")]
+RELOGIN = os.environ.get("AI_RELOGIN", "").split()
+
+
+def cdp(path, method="GET"):
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}{path}", method=method)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+        return json.loads(raw) if raw[:1] in (b"[", b"{") else raw
+
+
+def main():
+    if not PORT or not (URLS or RELOGIN):
+        return 0
+    try:
+        cdp("/json/version")
+    except OSError as err:
+        print(f"상시 브라우저에 연결 실패: {err}")
+        return 1
+    for url in URLS:
+        tab = cdp("/json/new?" + url, method="PUT")
+        time.sleep(15)
+        try:
+            cdp(f"/json/close/{tab['id']}")
+        except OSError:
+            pass
+        print(f"세션 유지: {urllib.parse.urlparse(url).hostname}")
+    for site in RELOGIN:
+        res = subprocess.run(["/usr/local/bin/ai-browser-relogin", site], capture_output=True, text=True, timeout=180)
+        print(f"{site}: {(res.stdout or res.stderr).strip()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "allow": [
+      "Read(/home/bot-concierge/bots/concierge/**)",
+      "Read(/etc/ai-team-projects/**)",
+      "Glob",
+      "Grep",
+      "Edit(/home/bot-concierge/bots/concierge/notes/**)",
+      "mcp__plugin_telegram_telegram",
+      "mcp__telegram"
+    ],
+    "deny": [
+      "Bash(sudo *)",
+      "WebFetch",
+      "Read(/home/bot-concierge/.config/**)",
+      "Read(/home/bot-concierge/.claude/**)",
+      "Read(/home/bot-concierge/.claude.json)",
+      "Read(/home/bot-concierge/.browser-profile/**)",
+      "Edit(/home/bot-concierge/.claude/**)",
+      "Edit(/home/bot-concierge/.claude.json)"
+    ]
+  }
+}

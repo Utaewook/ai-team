@@ -1,0 +1,9 @@
+[Unit]
+Description=Run AI Team dispatcher every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

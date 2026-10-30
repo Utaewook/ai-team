@@ -1,0 +1,10 @@
+{
+  "saramin": {
+    "domain": "saramin.co.kr",
+    "check_url": "https://www.saramin.co.kr/zf_user/",
+    "logged_in": "님을 위한|님이 꼭|로그아웃",
+    "login_url": "https://www.saramin.co.kr/zf_user/auth",
+    "button_text": "카카오",
+    "button_fallback": "[class*=\"kakao\"], [id*=\"kakao\"], [data-type*=\"kakao\"]"
+  }
+}

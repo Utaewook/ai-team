@@ -1,0 +1,79 @@
+#!/bin/bash
+# vault-sync — Obsidian 볼트 동기화 (leader 사용자, 5분마다 + leader 가 노트를 고친 직후)
+#
+# 원칙: 원격(사용자가 다른 기기에서 고친 내용)이 항상 우선.
+#   1) leader 의 변경을 먼저 커밋
+#   2) 원격을 받아오며 같은 부분이 충돌하면 원격 내용을 채택 (rebase 에서는 -X ours 가 '원격 쪽')
+#   3) 그래도 정리가 안 되는 충돌(한쪽은 삭제·한쪽은 수정 등)이면 원격 상태로 맞추고,
+#      leader 커밋은 refs/leader-dropped/<시각> 에 보존 (사라지지 않음)
+#   4) 푸시 (다른 기기와 동시에 푸시해 거절되면 한 번 더 받아서 재시도)
+# 결과는 ~/.local/state/vault-sync.log 에 남고, 마지막 결과는 vault-sync --status 로 확인.
+
+VAULT="${VAULT_DIR:-$HOME/vault}"
+STATE="$HOME/.local/state"
+LOG="$STATE/vault-sync.log"
+mkdir -p "$STATE"
+log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
+
+if [ "${1:-}" = "--status" ]; then
+  tail -n 15 "$LOG" 2>/dev/null || echo "기록 없음"
+  git -C "$VAULT" for-each-ref --format='보존된 leader 커밋: %(refname:short) %(objectname:short)' refs/leader-dropped 2>/dev/null
+  exit 0
+fi
+
+cd "$VAULT" || { log "❌ 볼트 폴더 없음: $VAULT"; exit 1; }
+exec 9>"$STATE/vault-sync.lock"
+flock -n 9 || exit 0                         # 이미 동기화 중이면 건너뜀
+
+BRANCH="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+BRANCH="${BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
+
+# 이전 실행이 중간에 끊겨 rebase 가 남아 있으면 정리
+{ [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; } && git rebase --abort 2>/dev/null
+if [ -n "$(git ls-files -u)" ]; then          # 충돌 표시가 남은 파일 → 마지막 커밋 상태로 정리
+  git stash push -q -m vault-sync-unmerged 2>/dev/null || git reset -q --hard HEAD
+  log "⚠️ 이전 충돌 흔적 정리"
+fi
+
+# 1) leader 변경 커밋 (.obsidian 설정·화면 상태는 leader 가 건드리지 않으므로 커밋하지 않음)
+git add -A -- . ':(exclude).obsidian' 2>/dev/null
+if ! git diff --cached --quiet; then
+  changed="$(git diff --cached --name-only | head -5 | tr '\n' ' ')"
+  git commit -q -m "leader: 노트 업데이트 $(date '+%F %T')" && log "📝 leader 변경 커밋: $changed"
+fi
+
+pull_remote_first() {
+  local before; before="$(git rev-parse HEAD)"
+  if git pull -q --rebase --autostash -X ours origin "$BRANCH" 2>>"$LOG"; then
+    if [ -n "$(git ls-files -u)" ]; then      # 커밋 안 된 로컬 변경(.obsidian 등)이 원격과 겹침 → 원격 채택, 로컬은 stash 에 보존됨
+      git reset -q --hard HEAD
+      log "⚠️ 커밋 안 된 로컬 변경은 원격과 겹쳐 stash 에 남김 (git stash list)"
+    fi
+    return 0
+  fi
+  git rebase --abort 2>/dev/null
+  git fetch -q origin "$BRANCH"
+  if [ "$(git rev-list --count "origin/$BRANCH..$before")" -gt 0 ]; then
+    git update-ref "refs/leader-dropped/$(date +%Y%m%d-%H%M%S)" "$before"
+    log "⚠️ 정리할 수 없는 충돌 → 원격 상태로 맞춤. leader 커밋은 refs/leader-dropped 에 보존 ($(git rev-parse --short "$before"))"
+  fi
+  local stashed=""
+  git stash push -q -m vault-sync 2>/dev/null && git stash list | grep -q vault-sync && stashed=1
+  git reset -q --hard "origin/$BRANCH"
+  if [ -n "$stashed" ] && ! git stash pop -q 2>>"$LOG"; then
+    git reset -q --hard "origin/$BRANCH"     # 겹친 부분은 원격 그대로, 로컬 변경은 stash 에 남아 있음
+    log "⚠️ 커밋 안 된 로컬 변경(.obsidian 등)은 원격과 겹쳐 stash 에 남김 (git stash list)"
+  fi
+}
+
+# 2) 원격 우선으로 받기
+pull_remote_first
+
+# 3) 푸시 (거절되면 한 번 더 받아서 재시도)
+if [ "$(git rev-list --count "origin/$BRANCH..HEAD" 2>/dev/null || echo 0)" -gt 0 ]; then
+  if git push -q origin "HEAD:$BRANCH" 2>>"$LOG" || { pull_remote_first && git push -q origin "HEAD:$BRANCH" 2>>"$LOG"; }; then
+    log "⬆️ 푸시 완료"
+  else
+    log "❌ 푸시 실패 (다음 동기화 때 다시 시도)"
+  fi
+fi

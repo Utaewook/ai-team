@@ -1,0 +1,13 @@
+# research 봇 정의 — 고친 뒤 sudo ai-bot apply research
+# 외부 웹을 읽는 봇이라 권한을 가장 좁게 둡니다 (프롬프트 인젝션 대비).
+enabled: true
+description: 조사 — 웹 조사·기술 비교·문서 요약
+model: sonnet
+telegram: true
+docker: false
+github: false
+writable: [notes]            # 조사 노트 저장 폴더
+dispatch:
+  work_in_repo: false
+  extra_args: ["--allowedTools", "WebSearch,WebFetch,Read,Grep,Glob",
+               "--disallowedTools", "Bash", "Edit", "Write", "NotebookEdit"]

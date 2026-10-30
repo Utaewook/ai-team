@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git *)", "Bash(gh pr *)", "Bash(gh run *)",
+      "Bash(npm *)", "Bash(npx *)", "Bash(pnpm *)", "Bash(node *)",
+      "Bash(python3 *)", "Bash(pytest *)", "Bash(uv *)", "Bash(uvx *)",
+      "Bash(docker *)", "Bash(make *)", "Bash(ls *)", "Bash(cat *)"
+    ],
+    "deny": [
+      "Bash(sudo *)",
+      "Bash(git push --force *)", "Bash(git push -f *)",
+      "Bash(git push origin main *)", "Bash(git push origin master *)", "Bash(git push origin HEAD:main *)"
+    ]
+  }
+}

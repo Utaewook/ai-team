@@ -1,0 +1,19 @@
+# leader 봇 정의 — 고친 뒤 sudo ai-bot apply leader
+enabled: true
+description: 리더 — Telegram 으로 대화, 작업 접수·Jira 등록 요청, (선택) 개인 볼트 관리
+model: haiku                 # 디스패처가 leader 에게 Jira 작업을 맡길 때의 모델
+telegram: true
+docker: false
+github: false
+# google: true             # Gmail 읽기·Calendar (ai-google). sudo ai-bot secret leader google
+# approve: [mail.send]     # 메일 발송을 확인 서비스로 요청 (매번 사람의 승인 코드). 발송 토큰: sudo ai-approve setup-google
+# approve: [project.add, project.brief]   # 새 프로젝트(Product 키) 추가·브리프 교체 (ai-project). Jira 토큰: sudo ai-approve setup-jira-admin
+# jira: true               # Jira 를 직접 조회·수정 (ai-jira). leader 전용 Jira 계정 토큰 필요: sudo ai-bot secret leader jira
+writable: [outbox]           # 디스패처에게 보내는 요청 파일 폴더
+git: {name: "AI Leader", email: "ai-leader@bots.local"}
+# 개인 Obsidian 볼트를 GitHub 로 동기화해 쓸 때만 (GitHub 토큰은 볼트 저장소 하나만 허용해서 발급)
+# vault: {repo: "https://github.com/<계정>/<볼트 저장소>.git", dir: vault}
+dispatch:
+  work_in_repo: false
+  extra_args: ["--allowedTools", "Read,Grep,Glob,WebSearch,WebFetch",
+               "--disallowedTools", "Bash", "Edit", "Write", "NotebookEdit"]
