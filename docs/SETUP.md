@@ -537,7 +537,9 @@ GitHub 은 VM 에 접근하지 않는다(SSH 키·self-hosted runner 없음). �
    ```
    안내대로 설정 저장소에 배포 키(쓰기 허용)를 등록하면 배포 계획이 출력된다.
 3. `sudo ai-team-deploy run --force` (첫 배포: 서버 설정이 설정 저장소에 첫 커밋으로 올라감) → `sudo ai-team-deploy enable`
-4. GitHub 코드 저장소 Settings → Branches → `main` 보호: PR 필수, 승인 1, 상태 검사 `test` 필수.
+4. GitHub 코드 저장소 Settings → Rules → Rulesets → New branch ruleset → 대상 `Include default branch`:
+   Require a pull request before merging(승인 0 — 1인 저장소에서 1이면 본인 PR 을 못 합침), Require status checks to pass: `test`, Bypass list 비움.
+5. 확인: 작은 PR 을 Merge → 5분 안에 텔레그램 "🚀 배포 완료" 알림.
 
 이후: PR Merge → (CI 통과 확인) → 설치 → 설정 생성 → 봇 재시작 → 점검 → 텔레그램 알림. 점검 실패면 직전 버전으로 자동 되돌림.
 `sudo ai-team-deploy status | plan | rollback | disable`.
