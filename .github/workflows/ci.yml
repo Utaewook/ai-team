@@ -18,6 +18,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # 공개 저장소에 이름·chat_id·이메일 등이 들어가면 실패. 패턴은 Secret 에만 있고 로그에는 파일:줄만 찍힘
+      - name: 개인정보 검사
+        env:
+          PRIVACY_PATTERNS: ${{ secrets.PRIVACY_PATTERNS }}
+          PR_FROM_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: python .github/scripts/pr_guard.py privacy
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -31,3 +37,33 @@ jobs:
           AI_PW_CORE: ${{ runner.temp }}/pw/node_modules/playwright-core
           CHROME: /usr/bin/google-chrome
         run: python -m pytest -v tests
+
+  # 보안 경로(root 실행·권한 경계)를 건드린 PR 에 ⚠️ 코멘트를 하나 달고, 이후 푸시마다 그 코멘트를 갱신
+  guard:
+    name: guard
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 보안 경로 변경 표시
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          body="$(python3 .github/scripts/pr_guard.py sensitive "$BASE" "$HEAD")"
+          echo "$body" >> "$GITHUB_STEP_SUMMARY"
+          id="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+                 --jq '.[] | select(.body | startswith("<!-- ai-team:pr-guard -->")) | .id' | head -1)"
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -f body="$body" >/dev/null
+          elif printf '%s' "$body" | grep -q '⚠️'; then
+            gh pr comment "$PR" --body "$body"
+          fi || echo "::warning::PR 코멘트를 달지 못함 (포크 PR 은 쓰기 권한 없음)"

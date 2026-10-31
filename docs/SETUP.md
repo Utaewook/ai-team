@@ -539,7 +539,13 @@ GitHub 은 VM 에 접근하지 않는다(SSH 키·self-hosted runner 없음). �
 3. `sudo ai-team-deploy run --force` (첫 배포: 서버 설정이 설정 저장소에 첫 커밋으로 올라감) → `sudo ai-team-deploy enable`
 4. GitHub 코드 저장소 Settings → Rules → Rulesets → New branch ruleset → 대상 `Include default branch`:
    Require a pull request before merging(승인 0 — 1인 저장소에서 1이면 본인 PR 을 못 합침), Require status checks to pass: `test`, Bypass list 비움.
-5. 확인: 작은 PR 을 Merge → 5분 안에 텔레그램 "🚀 배포 완료" 알림.
+5. 코드 저장소 Settings → Secrets and variables → Actions → New repository secret: Name `PRIVACY_PATTERNS`,
+   값은 공개 저장소에 들어가면 안 되는 문자열을 한 줄에 하나(이름·chat_id·개인 이메일 등). CI 가 저장소 전체에서 찾아 있으면 실패하고,
+   로그에는 파일:줄과 패턴 번호만 찍는다. 이 Secret 이 없으면 CI 가 실패한다(포크 PR 은 건너뜀).
+6. 확인: 작은 PR 을 Merge → 5분 안에 텔레그램 "🚀 배포 완료" 알림.
+
+PR 이 root 실행·권한 경계 파일(`.github/scripts/pr_guard.py` 의 `SENSITIVE`)을 건드리면 CI 의 `guard` 가 PR 에
+"⚠️ 보안 경로 변경" 코멘트를 단다. 봇이 만든 PR 이면 이 코멘트가 붙은 것만큼은 diff 를 직접 보고 Merge 한다.
 
 이후: PR Merge → (CI 통과 확인) → 설치 → 설정 생성 → 봇 재시작 → 점검 → 텔레그램 알림. 점검 실패면 직전 버전으로 자동 되돌림.
 `sudo ai-team-deploy status | plan | rollback | disable`.
